@@ -1,0 +1,15 @@
+Source: pxvirt-console
+Priority: optional
+Maintainer: Lierfang Team <itsupport@lierfang.com>
+Build-Depends: debhelper (>= 11),
+               pkg-config,
+               libclang-dev
+Standards-Version: 4.1.3
+Section: libs
+
+Package: pxvirt-console
+Section: optional
+Architecture: any
+Description: pxvirt-console
+Depends: ${misc:Depends}
+

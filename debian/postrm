@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        # Stop and disable pxvirt-console service
+        if [ -d /run/systemd/system ]; then
+            systemctl stop pxvirt-console.service 2>/dev/null || true
+            systemctl disable pxvirt-console.service 2>/dev/null || true
+            rm -f /etc/systemd/system/pxvirt-console.service
+
+            # Re-enable getty@tty1
+            systemctl daemon-reload
+            systemctl enable getty@tty1.service 2>/dev/null || true
+            systemctl start getty@tty1.service 2>/dev/null || true
+        fi
+        ;;
+esac

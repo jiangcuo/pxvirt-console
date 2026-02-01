@@ -1,0 +1,33 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+include /usr/share/dpkg/default.mk
+
+ARCH := $(shell dpkg-architecture -qDEB_HOST_GNU_CPU)
+
+ifeq ($(ARCH), x86_64)
+    TARGET := x86_64-unknown-linux-gnu
+else ifeq ($(ARCH), aarch64)
+    TARGET := aarch64-unknown-linux-gnu
+else ifeq ($(ARCH), loongarch64)
+    TARGET := loongarch64-unknown-linux-gnu
+else ifeq ($(ARCH), riscv64)
+    TARGET := riscv64gc-unknown-linux-gnu
+else
+    TARGET := $(ARCH)-unknown-linux-gnu
+endif
+
+TARGET_DIR := $(CURDIR)/rust-target
+
+
+%:
+	dh $@
+
+
+override_dh_auto_build:
+	cargo build --release --target $(TARGET) --target-dir $(TARGET_DIR)
+
+override_dh_auto_install:
+	install -d $(CURDIR)/debian/pxvirt-console/usr/sbin/
+	install -m 755 $(TARGET_DIR)/$(TARGET)/release/pxvirt-console $(CURDIR)/debian/pxvirt-console/usr/sbin/
+	install -d $(CURDIR)/debian/pxvirt-console/usr/share/pxvirt-console/
+	install -m 644 $(CURDIR)/debian/pxvirt-console.service $(CURDIR)/debian/pxvirt-console/usr/share/pxvirt-console/

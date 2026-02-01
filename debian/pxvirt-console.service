@@ -1,0 +1,22 @@
+[Unit]
+Description=PXVIRT Console on tty1
+Documentation=https://github.com/jiangcuo/pxvirt-console
+After=systemd-user-sessions.service
+After=rc-local.service
+Before=getty.target
+Conflicts=getty@tty1.service
+
+[Service]
+ExecStart=/usr/sbin/pxvirt-console
+Type=idle
+Restart=always
+RestartSec=1
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+[Install]
+WantedBy=multi-user.target

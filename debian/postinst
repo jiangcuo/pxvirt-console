@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+# Install systemd service
+if [ -d /run/systemd/system ]; then
+    # Copy service file
+    cp /usr/share/pxvirt-console/pxvirt-console.service /etc/systemd/system/
+
+    # Disable getty@tty1 to avoid conflict
+    systemctl disable getty@tty1.service 2>/dev/null || true
+    systemctl stop getty@tty1.service 2>/dev/null || true
+
+    # Enable and start pxvirt-console
+    systemctl daemon-reload
+    systemctl enable pxvirt-console.service
+    systemctl start pxvirt-console.service || true
+fi
