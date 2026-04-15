@@ -2,6 +2,12 @@ use crossterm::event::KeyCode;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
+
+const ROOT_USERNAME: &str = "root";
+pub const SESSION_IDLE_TIMEOUT_SECS: u64 = 60;
+const LOGIN_LOCK_THRESHOLD: usize = 3;
+const LOGIN_LOCKOUT_SECS: u64 = 60;
 
 #[derive(Clone, PartialEq)]
 pub enum Screen {
@@ -13,11 +19,17 @@ pub enum Screen {
     NetworkReset,
     NetworkSelectIface,
     NetworkConfigIP,
+    NetworkReview,
     RestartService,
     ServiceConfirm(usize),
 }
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub enum NetworkResetTaskResult {
+    Interfaces(Vec<NetIface>),
+    Applied,
+}
+
+pub const APP_VERSION: &str = env!("APP_VERSION");
 
 pub struct App {
     pub screen: Screen,
@@ -28,12 +40,14 @@ pub struct App {
     // System info
     pub pve_version: String,
     pub hostname: String,
+    pub kernel_version: String,
 
     // Login
     pub login_password: String,
     pub login_attempts: usize,
     pub login_checking: bool,
     pub login_rx: Option<mpsc::Receiver<bool>>,
+    login_locked_until: Option<Instant>,
 
     // Password form
     pub password_field: usize, // 0=username, 1=password, 2=confirm
@@ -48,6 +62,7 @@ pub struct App {
 
     // Network
     pub network_info: NetworkInfo,
+    pub network_draft: NetworkInfo,
     pub network_ifaces: Vec<NetIface>,
     pub network_index: usize,
     pub ping_target: String,
@@ -57,13 +72,14 @@ pub struct App {
 
     // Network reset async
     pub network_reset_status: Option<String>,
-    pub network_reset_rx: Option<mpsc::Receiver<Result<Vec<NetIface>, String>>>,
+    pub network_reset_rx: Option<mpsc::Receiver<Result<NetworkResetTaskResult, String>>>,
 
     // Message
     pub message: Option<(String, bool)>, // (msg, is_success)
 
     // Shell
     pub enter_shell: bool,
+    last_activity_at: Instant,
 }
 
 pub struct Service {
@@ -96,18 +112,21 @@ impl App {
             should_exit: false,
             pve_version: get_pve_version(),
             hostname: get_hostname(),
+            kernel_version: get_kernel_version(),
             login_password: String::new(),
             login_attempts: 0,
             login_checking: false,
             login_rx: None,
+            login_locked_until: None,
             password_field: 0,
-            username: "root".to_string(),
+            username: ROOT_USERNAME.to_string(),
             password: String::new(),
             password_confirm: String::new(),
             services: get_services(),
             service_restart_status: None,
             service_restart_rx: None,
             network_info: get_network_info(),
+            network_draft: NetworkInfo::default(),
             network_ifaces: Vec::new(),
             network_index: 0,
             ping_target: String::new(),
@@ -118,14 +137,54 @@ impl App {
             network_reset_rx: None,
             message: None,
             enter_shell: false,
+            last_activity_at: Instant::now(),
         }
     }
 
     pub fn logout(&mut self) {
+        self.clear_secret_fields();
         self.screen = Screen::Login;
+        self.main_index = 0;
+        self.service_index = 0;
         self.login_password.clear();
         self.login_attempts = 0;
+        self.login_checking = false;
+        self.login_rx = None;
+        self.login_locked_until = None;
+        self.service_restart_status = None;
+        self.service_restart_rx = None;
+        self.network_draft = NetworkInfo::default();
+        self.network_ifaces.clear();
+        self.network_index = 0;
+        self.ping_result = None;
+        self.ping_running = false;
+        self.ping_rx = None;
+        self.network_reset_status = None;
+        self.network_reset_rx = None;
+        self.enter_shell = false;
         self.message = None;
+        self.last_activity_at = Instant::now();
+    }
+
+    pub fn note_activity(&mut self) {
+        self.last_activity_at = Instant::now();
+    }
+
+    pub fn poll_session_timeout(&mut self) {
+        if matches!(self.screen, Screen::Login) {
+            return;
+        }
+
+        if self.last_activity_at.elapsed() >= Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS) {
+            self.logout();
+        }
+    }
+
+    pub fn login_lock_remaining_secs(&self) -> Option<u64> {
+        let now = Instant::now();
+        self.login_locked_until
+            .and_then(|until| until.checked_duration_since(now))
+            .map(|remaining| remaining.as_secs().max(1))
     }
 
     pub fn poll_login(&mut self) {
@@ -135,12 +194,35 @@ impl App {
                 self.login_rx = None;
                 if result {
                     self.screen = Screen::Main;
-                    self.login_password.clear();
                     self.login_attempts = 0;
+                    self.login_locked_until = None;
+                    self.note_activity();
                 } else {
-                    self.login_attempts += 1;
-                    self.login_password.clear();
-                    self.message = Some((format!("Invalid password (attempt {})", self.login_attempts), false));
+                    self.login_attempts = self.login_attempts.saturating_add(1);
+                    if self.login_attempts >= LOGIN_LOCK_THRESHOLD {
+                        self.login_locked_until =
+                            Some(Instant::now() + Duration::from_secs(LOGIN_LOCKOUT_SECS));
+                        self.message = Some((
+                            format!(
+                                "Invalid password (attempt {}). Login locked for {}s",
+                                self.login_attempts, LOGIN_LOCKOUT_SECS
+                            ),
+                            false,
+                        ));
+                        self.login_attempts = 0;
+                    } else {
+                        let remaining = LOGIN_LOCK_THRESHOLD - self.login_attempts;
+                        self.message = Some((
+                            format!(
+                                "Invalid password (attempt {}/{}). {} more wrong attempt(s) will lock login for {}s",
+                                self.login_attempts,
+                                LOGIN_LOCK_THRESHOLD,
+                                remaining,
+                                LOGIN_LOCKOUT_SECS
+                            ),
+                            false,
+                        ));
+                    }
                 }
             }
         }
@@ -153,6 +235,15 @@ impl App {
             "Restart Service",
             "Enter Shell",
         ]
+    }
+
+    pub fn pending_network_config_preview(&self) -> Result<String, String> {
+        if self.network_draft.iface.is_empty() {
+            return Err("No interface selected".to_string());
+        }
+
+        validate_network_config(&self.network_draft)?;
+        Ok(build_network_config(&self.network_draft.iface, &self.network_draft))
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
@@ -168,7 +259,10 @@ impl App {
             Screen::ResetPassword => self.handle_password(key),
             Screen::Network => self.handle_network(key),
             Screen::NetworkPing => self.handle_network_ping(key),
-            Screen::NetworkReset | Screen::NetworkSelectIface | Screen::NetworkConfigIP => {
+            Screen::NetworkReset
+            | Screen::NetworkSelectIface
+            | Screen::NetworkConfigIP
+            | Screen::NetworkReview => {
                 self.handle_network_reset(key);
             }
             Screen::RestartService => self.handle_service_list(key),
@@ -180,6 +274,24 @@ impl App {
     }
 
     fn handle_login(&mut self, key: KeyCode) {
+        if let Some(remaining) = self.login_lock_remaining_secs() {
+            match key {
+                KeyCode::Enter => {
+                    self.message = Some((
+                        format!("Too many failed attempts. Login is locked for {}s", remaining),
+                        false,
+                    ));
+                }
+                KeyCode::Char(_) | KeyCode::Backspace => {}
+                #[cfg(debug_assertions)]
+                KeyCode::Esc => {
+                    self.should_exit = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key {
             KeyCode::Char(c) => {
                 self.login_password.push(c);
@@ -189,12 +301,26 @@ impl App {
             }
             KeyCode::Enter => {
                 if !self.login_checking {
-                    let password = self.login_password.clone();
+                    if let Some(remaining) = self.login_lock_remaining_secs() {
+                        self.message = Some((
+                            format!("Too many failed attempts. Try again in {}s", remaining),
+                            false,
+                        ));
+                        return;
+                    }
+
+                    let mut password = std::mem::take(&mut self.login_password);
+                    if password.is_empty() {
+                        self.message = Some(("Password cannot be empty".to_string(), false));
+                        return;
+                    }
+
                     let (tx, rx) = mpsc::channel();
                     self.login_rx = Some(rx);
                     self.login_checking = true;
                     thread::spawn(move || {
                         let ok = matches!(pwcheck::pwcheck("root", &password), pwcheck::PwcheckResult::Ok);
+                        scrub_string(&mut password);
                         let _ = tx.send(ok);
                     });
                 }
@@ -222,14 +348,15 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right => match self.main_index {
                 0 => {
-                    self.username = "root".to_string();
-                    self.password.clear();
-                    self.password_confirm.clear();
-                    self.password_field = 0;
+                    self.username = ROOT_USERNAME.to_string();
+                    self.clear_password_form();
                     self.screen = Screen::ResetPassword;
                 }
                 1 => {
                     self.network_info = get_network_info();
+                    self.network_draft = NetworkInfo::default();
+                    self.network_ifaces.clear();
+                    self.network_index = 0;
                     self.ping_target = self.network_info.gateway.clone();
                     self.screen = Screen::Network;
                 }
@@ -250,6 +377,7 @@ impl App {
     fn handle_password(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Left => {
+                self.clear_password_form();
                 self.screen = Screen::Main;
             }
             KeyCode::Tab | KeyCode::Down => {
@@ -259,13 +387,13 @@ impl App {
                 self.password_field = if self.password_field == 0 { 2 } else { self.password_field - 1 };
             }
             KeyCode::Char(c) => match self.password_field {
-                0 => self.username.push(c),
+                0 => {}
                 1 => self.password.push(c),
                 2 => self.password_confirm.push(c),
                 _ => {}
             },
             KeyCode::Backspace => match self.password_field {
-                0 => { self.username.pop(); }
+                0 => {}
                 1 => { self.password.pop(); }
                 2 => { self.password_confirm.pop(); }
                 _ => {}
@@ -278,17 +406,25 @@ impl App {
     }
 
     fn submit_password(&mut self) {
-        if self.password.is_empty() {
+        self.username = ROOT_USERNAME.to_string();
+        let mut password = std::mem::take(&mut self.password);
+        let mut password_confirm = std::mem::take(&mut self.password_confirm);
+
+        if password.is_empty() {
+            scrub_string(&mut password_confirm);
             self.message = Some(("Password cannot be empty".to_string(), false));
             return;
         }
-        if self.password != self.password_confirm {
+        if password != password_confirm {
+            scrub_string(&mut password);
+            scrub_string(&mut password_confirm);
             self.message = Some(("Passwords do not match".to_string(), false));
             return;
         }
+        scrub_string(&mut password_confirm);
 
         // Use chpasswd to change password
-        let input = format!("{}:{}", self.username, self.password);
+        let mut input = format!("{}:{}", self.username, password);
         let result = Command::new("chpasswd")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -299,6 +435,8 @@ impl App {
                 }
                 child.wait()
             });
+        scrub_string(&mut input);
+        scrub_string(&mut password);
 
         match result {
             Ok(status) if status.success() => {
@@ -424,7 +562,7 @@ impl App {
                 self.network_reset_rx = None;
                 self.network_reset_status = None;
                 match result {
-                    Ok(ifaces) => {
+                    Ok(NetworkResetTaskResult::Interfaces(ifaces)) => {
                         self.network_ifaces = ifaces;
                         self.network_index = 0;
                         if self.network_ifaces.is_empty() {
@@ -434,9 +572,20 @@ impl App {
                             self.screen = Screen::NetworkSelectIface;
                         }
                     }
+                    Ok(NetworkResetTaskResult::Applied) => {
+                        self.network_info = get_network_info();
+                        self.ping_target = self.network_info.gateway.clone();
+                        self.network_draft = NetworkInfo::default();
+                        self.network_ifaces.clear();
+                        self.network_index = 0;
+                        self.message = Some(("Network configured successfully".to_string(), true));
+                        self.screen = Screen::Network;
+                    }
                     Err(e) => {
                         self.message = Some((e, false));
-                        self.screen = Screen::Network;
+                        if matches!(self.screen, Screen::NetworkReset) {
+                            self.screen = Screen::Network;
+                        }
                     }
                 }
             }
@@ -446,22 +595,24 @@ impl App {
     fn handle_network_reset(&mut self, key: KeyCode) {
         match &self.screen {
             Screen::NetworkReset => {
+                if self.network_reset_rx.is_some() {
+                    return;
+                }
+
                 match key {
                     KeyCode::Esc | KeyCode::Left => {
                         self.screen = Screen::Network;
                     }
                     KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        // Start async network reset
-                        if self.network_reset_rx.is_none() {
-                            let (tx, rx) = mpsc::channel();
-                            self.network_reset_rx = Some(rx);
-                            self.network_reset_status = Some("Backing up config...".to_string());
-                            
-                            thread::spawn(move || {
-                                let result = do_network_reset_async();
-                                let _ = tx.send(result);
-                            });
-                        }
+                        let (tx, rx) = mpsc::channel();
+                        self.network_reset_rx = Some(rx);
+                        self.network_reset_status = Some("Detecting physical interfaces...".to_string());
+                        self.network_draft = NetworkInfo::default();
+
+                        thread::spawn(move || {
+                            let result = Ok(NetworkResetTaskResult::Interfaces(detect_physical_interfaces()));
+                            let _ = tx.send(result);
+                        });
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') => {
                         self.screen = Screen::Network;
@@ -485,10 +636,14 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        // Move to IP config
-                        self.network_info.ip.clear();
-                        self.network_info.netmask = "255.255.255.0".to_string();
-                        self.network_info.gateway.clear();
+                        if let Some(iface) = self.network_ifaces.get(self.network_index) {
+                            self.network_draft = NetworkInfo {
+                                ip: String::new(),
+                                netmask: "255.255.255.0".to_string(),
+                                gateway: self.network_info.gateway.clone(),
+                                iface: iface.name.clone(),
+                            };
+                        }
                         self.password_field = 0; // reuse for field selection
                         self.screen = Screen::NetworkConfigIP;
                     }
@@ -507,33 +662,63 @@ impl App {
                         self.password_field = if self.password_field == 0 { 2 } else { self.password_field - 1 };
                     }
                     KeyCode::Char(c) => {
-                        match self.password_field {
-                            0 => self.network_info.ip.push(c),
-                            1 => self.network_info.netmask.push(c),
-                            2 => self.network_info.gateway.push(c),
-                            _ => {}
+                        if is_network_input_char(c) {
+                            match self.password_field {
+                                0 => self.network_draft.ip.push(c),
+                                1 => self.network_draft.netmask.push(c),
+                                2 => self.network_draft.gateway.push(c),
+                                _ => {}
+                            }
                         }
                     }
                     KeyCode::Backspace => {
                         match self.password_field {
-                            0 => { self.network_info.ip.pop(); }
-                            1 => { self.network_info.netmask.pop(); }
-                            2 => { self.network_info.gateway.pop(); }
+                            0 => { self.network_draft.ip.pop(); }
+                            1 => { self.network_draft.netmask.pop(); }
+                            2 => { self.network_draft.gateway.pop(); }
                             _ => {}
                         }
                     }
                     KeyCode::Enter => {
-                        // Apply config
-                        if let Some(iface) = self.network_ifaces.get(self.network_index) {
-                            match self.apply_network_config(&iface.name) {
-                                Ok(_) => {
-                                    self.message = Some(("Network configured successfully".to_string(), true));
-                                    self.network_info = get_network_info();
-                                    self.screen = Screen::Network;
-                                }
-                                Err(e) => {
-                                    self.message = Some((format!("Failed: {}", e), false));
-                                }
+                        match validate_network_config(&self.network_draft) {
+                            Ok(_) => {
+                                self.screen = Screen::NetworkReview;
+                            }
+                            Err(e) => {
+                                self.message = Some((format!("Failed: {}", e), false));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Screen::NetworkReview => {
+                if self.network_reset_rx.is_some() {
+                    return;
+                }
+
+                match key {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.screen = Screen::NetworkConfigIP;
+                    }
+                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        match self.pending_network_config_preview() {
+                            Ok(_) => {
+                                let draft = self.network_draft.clone();
+                                let iface_name = draft.iface.clone();
+                                let (tx, rx) = mpsc::channel();
+                                self.network_reset_rx = Some(rx);
+                                self.network_reset_status =
+                                    Some("Applying network configuration...".to_string());
+
+                                thread::spawn(move || {
+                                    let result = apply_network_config(&iface_name, &draft)
+                                        .map(|_| NetworkResetTaskResult::Applied);
+                                    let _ = tx.send(result);
+                                });
+                            }
+                            Err(e) => {
+                                self.message = Some((format!("Failed: {}", e), false));
                             }
                         }
                     }
@@ -541,48 +726,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-    }
-
-
-    fn apply_network_config(&self, iface_name: &str) -> Result<(), String> {
-        use std::fs;
-
-        let cidr = netmask_to_cidr_num(&self.network_info.netmask);
-        let config = format!(
-            r#"auto lo
-iface lo inet loopback
-
-auto {}
-iface {} inet manual
-
-auto vmbr0
-iface vmbr0 inet static
-    address {}/{}
-    gateway {}
-    bridge-ports {}
-    bridge-stp off
-    bridge-fd 0
-"#,
-            iface_name,
-            iface_name,
-            self.network_info.ip,
-            cidr,
-            self.network_info.gateway,
-            iface_name
-        );
-
-        fs::write("/etc/network/interfaces", &config)
-            .map_err(|e| format!("Write failed: {}", e))?;
-
-        // Apply with ifreload
-        let status = Command::new("ifreload").arg("-a").status()
-            .map_err(|e| format!("ifreload failed: {}", e))?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err("ifreload returned error".to_string())
         }
     }
 
@@ -635,6 +778,163 @@ iface vmbr0 inet static
     }
 }
 
+fn scrub_string(value: &mut String) {
+    let mut bytes = std::mem::take(value).into_bytes();
+    bytes.fill(0);
+}
+
+fn build_network_config(iface_name: &str, info: &NetworkInfo) -> String {
+    let cidr = netmask_to_cidr_num(&info.netmask);
+    format!(
+        r#"auto lo
+iface lo inet loopback
+
+auto {}
+iface {} inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address {}/{}
+    gateway {}
+    bridge-ports {}
+    bridge-stp off
+    bridge-fd 0
+"#,
+        iface_name,
+        iface_name,
+        info.ip,
+        cidr,
+        info.gateway,
+        iface_name
+    )
+}
+
+fn backup_interfaces_dir(timestamp: &str) -> Result<Option<String>, String> {
+    use std::fs;
+
+    let interfaces_d = std::path::Path::new("/etc/network/interfaces.d");
+    if !interfaces_d.exists() {
+        return Ok(None);
+    }
+
+    let backup_dir = format!("/etc/network/interfaces.d.bak.{}", timestamp);
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("interfaces.d backup dir failed: {}", e))?;
+
+    for entry in fs::read_dir(interfaces_d).map_err(|e| format!("Read interfaces.d failed: {}", e))? {
+        let entry = entry.map_err(|e| format!("Read interfaces.d entry failed: {}", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Read interfaces.d entry type failed: {}", e))?;
+        if file_type.is_dir() {
+            return Err("interfaces.d contains a directory; refusing automatic reset".to_string());
+        }
+
+        let target = std::path::Path::new(&backup_dir).join(entry.file_name());
+        fs::copy(entry.path(), &target)
+            .map_err(|e| format!("interfaces.d backup copy failed: {}", e))?;
+    }
+
+    Ok(Some(backup_dir))
+}
+
+fn clear_interfaces_dir() -> Result<(), String> {
+    use std::fs;
+
+    let interfaces_d = std::path::Path::new("/etc/network/interfaces.d");
+    if !interfaces_d.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(interfaces_d).map_err(|e| format!("Read interfaces.d failed: {}", e))? {
+        let entry = entry.map_err(|e| format!("Read interfaces.d entry failed: {}", e))?;
+        let path = entry.path();
+        if path.is_dir() {
+            return Err("interfaces.d contains a directory; refusing automatic reset".to_string());
+        }
+        fs::remove_file(&path).map_err(|e| format!("Clear interfaces.d failed: {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn restore_interfaces_dir(backup_dir: Option<&str>) -> Result<(), String> {
+    use std::fs;
+
+    let interfaces_d = std::path::Path::new("/etc/network/interfaces.d");
+    fs::create_dir_all(interfaces_d)
+        .map_err(|e| format!("Recreate interfaces.d failed: {}", e))?;
+    clear_interfaces_dir()?;
+
+    if let Some(backup_dir) = backup_dir {
+        for entry in fs::read_dir(backup_dir).map_err(|e| format!("Read interfaces.d backup failed: {}", e))? {
+            let entry = entry.map_err(|e| format!("Read interfaces.d backup entry failed: {}", e))?;
+            let target = interfaces_d.join(entry.file_name());
+            fs::copy(entry.path(), target)
+                .map_err(|e| format!("Restore interfaces.d failed: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_network_config(iface_name: &str, info: &NetworkInfo) -> Result<(), String> {
+    use chrono::Local;
+    use std::fs;
+
+    validate_network_config(info)?;
+
+    let config = build_network_config(iface_name, info);
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let backup_path = format!("/etc/network/interfaces.bak.{}", timestamp);
+
+    fs::copy("/etc/network/interfaces", &backup_path)
+        .map_err(|e| format!("Backup failed: {}", e))?;
+    let interfaces_d_backup = backup_interfaces_dir(&timestamp)?;
+
+    let apply_result = (|| -> Result<(), String> {
+        fs::write("/etc/network/interfaces", &config)
+            .map_err(|e| format!("Write failed: {}", e))?;
+        clear_interfaces_dir()?;
+
+        let status = Command::new("ifreload")
+            .arg("-a")
+            .status()
+            .map_err(|e| format!("ifreload failed: {}", e))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("ifreload returned error".to_string())
+        }
+    })();
+
+    if apply_result.is_ok() {
+        return Ok(());
+    }
+
+    let apply_error = apply_result.err().unwrap_or_else(|| "Unknown error".to_string());
+    let rollback_interfaces =
+        fs::copy(&backup_path, "/etc/network/interfaces").map_err(|e| format!("Rollback failed: {}", e));
+    let rollback_dir = restore_interfaces_dir(interfaces_d_backup.as_deref());
+
+    if rollback_interfaces.is_ok() && rollback_dir.is_ok() {
+        let _ = Command::new("ifreload").arg("-a").status();
+        Err(format!(
+            "{}; configuration was rolled back",
+            apply_error
+        ))
+    } else {
+        let mut details = vec![apply_error];
+        if let Err(e) = rollback_interfaces {
+            details.push(e);
+        }
+        if let Err(e) = rollback_dir {
+            details.push(e);
+        }
+        Err(details.join("; "))
+    }
+}
+
 fn get_services() -> Vec<Service> {
     let service_names = [
         ("pve-cluster", "PVE Cluster"),
@@ -679,6 +979,13 @@ fn get_pve_version() -> String {
 
 fn get_hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn get_kernel_version() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_default()
         .trim()
         .to_string()
@@ -741,34 +1048,72 @@ fn netmask_to_cidr_num(netmask: &str) -> u8 {
         .sum()
 }
 
-fn do_network_reset_async() -> Result<Vec<NetIface>, String> {
-    use std::fs;
-    use chrono::Local;
+fn is_network_input_char(c: char) -> bool {
+    c.is_ascii_digit() || c == '.'
+}
 
-    // Step 1: Backup
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let backup_path = format!("/etc/network/interfaces.bak.{}", timestamp);
-    fs::copy("/etc/network/interfaces", &backup_path)
-        .map_err(|e| format!("Backup failed: {}", e))?;
+fn is_valid_netmask(value: &str) -> bool {
+    let Ok(addr) = value.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
 
-    // Step 2: Write minimal config
-    let minimal_config = "auto lo\niface lo inet loopback\n";
-    fs::write("/etc/network/interfaces", minimal_config)
-        .map_err(|e| format!("Write failed: {}", e))?;
+    let mask = u32::from(addr);
+    let inverted = !mask;
+    (inverted & (inverted + 1)) == 0
+}
 
-    // Step 3: Clear interfaces.d
-    if let Ok(entries) = fs::read_dir("/etc/network/interfaces.d") {
-        for entry in entries.flatten() {
-            let _ = fs::remove_file(entry.path());
-        }
+fn parse_ipv4_field(value: &str, field_name: &str) -> Result<std::net::Ipv4Addr, String> {
+    value
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| format!("Invalid {}", field_name))
+}
+
+fn validate_network_config(info: &NetworkInfo) -> Result<(), String> {
+    let ip = parse_ipv4_field(&info.ip, "IP address")?;
+    let gateway = parse_ipv4_field(&info.gateway, "gateway")?;
+
+    if !is_valid_netmask(&info.netmask) {
+        return Err("Invalid netmask".to_string());
     }
 
-    // Step 4: Reload network
-    Command::new("ifreload").arg("-a").status().ok();
+    let netmask = parse_ipv4_field(&info.netmask, "netmask")?;
+    let mask = u32::from(netmask);
+    let prefix = mask.count_ones();
 
-    // Step 5: Detect interfaces
-    let interfaces = detect_physical_interfaces();
-    Ok(interfaces)
+    if prefix == 0 || prefix >= 31 {
+        return Err("Netmask must be between /1 and /30".to_string());
+    }
+
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return Err("IP address must be a usable unicast host address".to_string());
+    }
+
+    if gateway.is_unspecified() || gateway.is_loopback() || gateway.is_multicast() {
+        return Err("Gateway must be a usable unicast host address".to_string());
+    }
+
+    let ip_u32 = u32::from(ip);
+    let gateway_u32 = u32::from(gateway);
+    let network = ip_u32 & mask;
+    let broadcast = network | !mask;
+
+    if ip_u32 == network || ip_u32 == broadcast {
+        return Err("IP address cannot be the network or broadcast address".to_string());
+    }
+
+    if gateway_u32 == network || gateway_u32 == broadcast {
+        return Err("Gateway cannot be the network or broadcast address".to_string());
+    }
+
+    if ip == gateway {
+        return Err("IP address cannot be the same as gateway".to_string());
+    }
+
+    if (gateway_u32 & mask) != network {
+        return Err("Gateway must be in the same subnet as the IP address".to_string());
+    }
+
+    Ok(())
 }
 
 fn detect_physical_interfaces() -> Vec<NetIface> {
@@ -827,4 +1172,17 @@ fn detect_physical_interfaces() -> Vec<NetIface> {
     }
 
     interfaces
+}
+
+impl App {
+    fn clear_password_form(&mut self) {
+        scrub_string(&mut self.password);
+        scrub_string(&mut self.password_confirm);
+        self.password_field = 0;
+    }
+
+    fn clear_secret_fields(&mut self) {
+        scrub_string(&mut self.login_password);
+        self.clear_password_form();
+    }
 }

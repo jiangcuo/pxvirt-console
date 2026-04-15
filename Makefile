@@ -4,7 +4,7 @@ include /usr/share/dpkg/default.mk
 BUILD_DIR := build
 
 # 需要复制的文件和目录
-COPY_ITEMS := src debian Cargo.toml
+COPY_ITEMS := build.rs src debian Cargo.toml
 
 .PHONY: deb clean 
 
@@ -25,15 +25,12 @@ deb:
 	@for item in $(COPY_ITEMS); do \
 		cp -r $$item $(BUILD_DIR)/; \
 	done
-
-	@GIT_SHORT_ID=$$(git rev-parse --short HEAD); \
-	CURRENT_VERSION=$$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
-	NEW_VERSION="$${CURRENT_VERSION}+$${GIT_SHORT_ID}"; \
-	sed -i "s/^version = .*/version = \"$${NEW_VERSION}\"/" $(BUILD_DIR)/Cargo.toml; 
+	@if git rev-parse --short=8 HEAD >/dev/null 2>&1; then \
+		git rev-parse --short=8 HEAD > $(BUILD_DIR)/.git-revision; \
+	fi
 
 	@if [ "$(ARCH)" != "$(TARGET_ARCH)" ]; then \
 		cd $(BUILD_DIR) && dpkg-buildpackage -us -uc -b -a$(ARCH) -Pcross; \
 	else \
 		cd $(BUILD_DIR) && dpkg-buildpackage -us -uc -b -a$(ARCH); \
 	fi
-

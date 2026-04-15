@@ -2,7 +2,8 @@
 name = "pxvirt-console"
 version = "0.1.0"
 edition = "2021"
-description = "Proxmox VE Direct Console User Interface"
+build = "build.rs"
+description = "Pxvirt Direct Console User Interface"
 authors = ["lierfang"]
 
 [dependencies]

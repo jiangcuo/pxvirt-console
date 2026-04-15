@@ -1,7 +1,7 @@
 mod app;
 mod ui;
 
-use app::{App, Screen};
+use app::{App, Screen, SESSION_IDLE_TIMEOUT_SECS};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, poll},
@@ -40,7 +40,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(
     let mut app = App::new();
 
     loop {
-        // Poll async operations
+        // Lock stale sessions before processing any background results.
+        app.poll_session_timeout();
         app.poll_login();
         app.poll_ping();
         app.poll_service_restart();
@@ -52,6 +53,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(
         if poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    app.note_activity();
+
                     // Q = logout (back to login screen)
                     if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
                         && matches!(app.screen, Screen::Main)
@@ -76,16 +79,22 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(
                         
                         // Clear screen and show hint
                         print!("\x1B[2J\x1B[H");
-                        println!("Entering shell... Type 'exit' to return to console.\n");
+                        println!("Entering shell... Type 'exit' to return to console.");
+                        println!(
+                            "Shell will auto-logout after {} minutes of inactivity.\n",
+                            SESSION_IDLE_TIMEOUT_SECS / 60
+                        );
                         io::stdout().flush().ok();
                         
                         // Run bash as foreground process with inherited stdio
                         let _ = Command::new("/bin/bash")
-                            .arg("-l")
+                            .args(["-i", "-l"])
+                            .env("TMOUT", SESSION_IDLE_TIMEOUT_SECS.to_string())
                             .stdin(std::process::Stdio::inherit())
                             .stdout(std::process::Stdio::inherit())
                             .stderr(std::process::Stdio::inherit())
                             .status();
+                        app.logout();
                         
                         // Re-enter TUI
                         enable_raw_mode()?;

@@ -1,9 +1,10 @@
 use crate::app::{App, Screen};
+use chrono::Local;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -29,8 +30,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(
-        "Proxmox VE Console v{}  |  {}  |  PVE {}",
-        crate::app::VERSION, app.hostname, app.pve_version
+        "{}|Pxvirt {}|{}",
+        app.hostname,
+        app.pve_version,
+        app.kernel_version
     );
     let header = Paragraph::new(title)
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
@@ -40,17 +43,37 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.screen {
-        Screen::Login => "Enter password  Esc Exit",
+        Screen::Login => "Enter password",
         Screen::Main => "↑↓ Navigate  Enter Select  Q Logout",
         Screen::ResetPassword => "Tab/↑↓ Switch field  Enter Submit  Esc Back",
         Screen::Network => "P Ping  R Reset Network  Esc Back",
         Screen::NetworkPing => "Enter Ping  Esc Back",
-        Screen::NetworkReset | Screen::NetworkSelectIface | Screen::NetworkConfigIP => "Esc Back",
+        Screen::NetworkReset => "Enter Continue  N/Esc Back",
+        Screen::NetworkSelectIface => "↑↓ Select  Enter Next  Esc Back",
+        Screen::NetworkConfigIP => "Tab/↑↓ Switch  Enter Review  Esc Back",
+        Screen::NetworkReview => "Enter/Y Apply  N/Esc Back",
         Screen::RestartService => "↑↓ Navigate  Enter Select  Esc Back",
         Screen::ServiceConfirm(_) => "Y Confirm  N/Esc Cancel",
     };
+    let status = format!(
+        "Pxvirt Console v{} | {}",
+        crate::app::APP_VERSION,
+        Local::now().format("%m-%d %H:%M")
+    );
+    let status_width = (status.chars().count() as u16).saturating_add(1).min(area.width);
+
+    let sections = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(status_width)])
+        .split(area);
+
     let footer = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, area);
+    f.render_widget(footer, sections[0]);
+
+    let footer_status = Paragraph::new(status)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Right);
+    f.render_widget(footer_status, sections[1]);
 }
 
 fn draw_content(f: &mut Frame, app: &App, area: Rect) {
@@ -75,7 +98,7 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect) {
         }
         Screen::ResetPassword => draw_password_form(f, app, columns[1]),
         Screen::Network | Screen::NetworkPing | Screen::NetworkReset 
-        | Screen::NetworkSelectIface | Screen::NetworkConfigIP => {
+        | Screen::NetworkSelectIface | Screen::NetworkConfigIP | Screen::NetworkReview => {
             draw_network(f, app, columns[1]);
         }
         Screen::RestartService | Screen::ServiceConfirm(_) => draw_service_list(f, app, columns[1]),
@@ -104,7 +127,7 @@ fn draw_login(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(login_area);
 
-    let title = Paragraph::new("Proxmox VE Console")
+    let title = Paragraph::new("Pxvirt Console")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(title, inner[0]);
@@ -115,11 +138,22 @@ fn draw_login(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
             .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(status, inner[2]);
+    } else if let Some(remaining) = app.login_lock_remaining_secs() {
+        let password_line = Paragraph::new(format!("Password: [locked {}s]", remaining))
+            .style(Style::default().fg(Color::Red));
+        f.render_widget(password_line, inner[2]);
     } else {
         let password_display = "*".repeat(app.login_password.len());
         let password_line = Paragraph::new(format!("Password: {}_", password_display))
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(password_line, inner[2]);
+    }
+
+    if let Some(remaining) = app.login_lock_remaining_secs() {
+        let status = Paragraph::new(format!("Login locked for {}s", remaining))
+            .style(Style::default().fg(Color::Red))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(status, inner[3]);
     }
 }
 
@@ -162,7 +196,7 @@ fn draw_password_form(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let fields = [
-        ("Username", &app.username, 0),
+        ("Username (fixed)", &app.username, 0),
         ("New Password", &"*".repeat(app.password.len()), 1),
         ("Confirm Password", &"*".repeat(app.password_confirm.len()), 2),
     ];
@@ -267,6 +301,9 @@ fn draw_network(f: &mut Frame, app: &App, area: Rect) {
         Screen::NetworkConfigIP => {
             draw_network_config_ip(f, app);
         }
+        Screen::NetworkReview => {
+            draw_network_review(f, app);
+        }
         _ => {}
     }
 }
@@ -298,11 +335,13 @@ fn draw_network_reset_confirm(f: &mut Frame, app: &App) {
             .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(hint, inner[1]);
     } else {
-        let warning = Paragraph::new("WARNING: This will CLEAR all network config!\nBackup will be created. Continue?")
+        let warning = Paragraph::new(
+            "Prepare a new network configuration wizard.\nNo changes are applied until the final confirmation."
+        )
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(warning, inner[0]);
 
-        let hint = Paragraph::new("[Y] Yes, reset  [N/Esc] Cancel")
+        let hint = Paragraph::new("[Enter/Y] Continue  [N/Esc] Cancel")
             .style(Style::default().fg(Color::White));
         f.render_widget(hint, inner[1]);
     }
@@ -345,18 +384,17 @@ fn draw_network_select_iface(f: &mut Frame, app: &App) {
 }
 
 fn draw_network_config_ip(f: &mut Frame, app: &App) {
-    let area = centered_rect(50, 10, f.area());
+    let area = centered_rect(58, 12, f.area());
     f.render_widget(Clear, area);
 
     let iface_name = app
-        .network_ifaces
-        .get(app.network_index)
-        .map(|i| i.name.as_str())
-        .unwrap_or("unknown");
+        .network_draft
+        .iface
+        .as_str();
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("Configure IP for {}", iface_name));
+        .title(format!("Configure IP for {}", if iface_name.is_empty() { "unknown" } else { iface_name }));
     f.render_widget(block, area);
 
     let inner = Layout::default()
@@ -365,14 +403,15 @@ fn draw_network_config_ip(f: &mut Frame, app: &App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(0),
         ])
         .split(area);
 
     let fields = [
-        ("IP Address", &app.network_info.ip, 0),
-        ("Netmask", &app.network_info.netmask, 1),
-        ("Gateway", &app.network_info.gateway, 2),
+        ("IP Address", &app.network_draft.ip, 0),
+        ("Netmask", &app.network_draft.netmask, 1),
+        ("Gateway", &app.network_draft.gateway, 2),
     ];
 
     for (label, value, idx) in fields {
@@ -386,6 +425,120 @@ fn draw_network_config_ip(f: &mut Frame, app: &App) {
         let text = format!("{}{}: {}{}", prefix, label, value, cursor);
         f.render_widget(Paragraph::new(text).style(style), inner[idx]);
     }
+
+    // let help = Paragraph::new(
+    //     "IP and gateway must be in the same subnet. Netmask must be between /1 and /30.",
+    // )
+    // .style(Style::default().fg(Color::DarkGray))
+    // .wrap(Wrap { trim: true });
+    // f.render_widget(help, inner[3]);
+}
+
+fn draw_network_review(f: &mut Frame, app: &App) {
+    let max_height = f.area().height.saturating_sub(2);
+    let review_height = max_height.min(22);
+    let area = centered_rect(92, review_height, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Review Network Configuration");
+    f.render_widget(block, area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .margin(1)
+        .constraints([Constraint::Length(30), Constraint::Min(0)])
+        .split(area);
+
+    let summary_block = Block::default().borders(Borders::ALL).title("Summary");
+    f.render_widget(summary_block, columns[0]);
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(columns[0]);
+
+    if let Some(status) = &app.network_reset_status {
+        let progress_block = Block::default().borders(Borders::ALL).title("Config Preview");
+        f.render_widget(progress_block, columns[1]);
+
+        let progress_inner = Layout::default()
+            .margin(1)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(columns[1]);
+
+        let progress = Paragraph::new(status.as_str())
+            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(progress, progress_inner[0]);
+
+        let hint = Paragraph::new("Applying changes, please wait...")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(hint, progress_inner[1]);
+        return;
+    }
+
+    let lines = [
+        format!("Interface: {}", app.network_draft.iface),
+        format!("IP Address: {}", app.network_draft.ip),
+        format!("Netmask: {}", app.network_draft.netmask),
+        format!("Gateway: {}", app.network_draft.gateway),
+    ];
+
+    for (idx, line) in lines.iter().enumerate() {
+        let p = Paragraph::new(line.as_str()).style(Style::default().fg(Color::White));
+        f.render_widget(p, inner[idx]);
+    }
+
+    let (preview, validation_ok) = match app.pending_network_config_preview() {
+        Ok(config) => (config, true),
+        Err(err) => (format!("Preview unavailable: {}", err), false),
+    };
+
+    let validation = if validation_ok {
+        "Validation: OK".to_string()
+    } else {
+        preview.clone()
+    };
+    let validation_style = if validation_ok {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    let validation_widget = Paragraph::new(validation)
+        .style(validation_style)
+        .wrap(Wrap { trim: true });
+    f.render_widget(validation_widget, inner[4]);
+
+    let preview_block = Block::default().borders(Borders::ALL).title("Config Preview");
+    f.render_widget(preview_block, columns[1]);
+
+    let preview_inner = Layout::default()
+        .margin(1)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(columns[1]);
+
+    let preview_lines: Vec<Line> = preview.lines().map(Line::from).collect();
+    f.render_widget(
+        Paragraph::new(preview_lines)
+            .style(Style::default().fg(Color::Cyan))
+            .wrap(Wrap { trim: false }),
+        preview_inner[0],
+    );
+
+    let hint = Paragraph::new("[Enter/Y] Apply configuration  [N/Esc] Back to edit")
+        .style(Style::default().fg(Color::Yellow));
+    f.render_widget(hint, preview_inner[1]);
 }
 
 fn netmask_to_cidr(netmask: &str) -> u8 {
@@ -510,12 +663,14 @@ fn draw_message(f: &mut Frame, msg: &str, success: bool) {
 }
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
+    let top = r.height.saturating_sub(height) / 2;
+    let bottom = r.height.saturating_sub(height + top);
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - height.min(100)) / 2),
+            Constraint::Length(top),
             Constraint::Length(height),
-            Constraint::Percentage((100 - height.min(100)) / 2),
+            Constraint::Length(bottom),
         ])
         .split(r);
 
