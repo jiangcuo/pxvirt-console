@@ -9,6 +9,8 @@ mod loader;
 mod login;
 mod metrics;
 mod modules;
+#[allow(dead_code)] // full copy of the pxvdi-sdk module
+mod punycode;
 mod rescue;
 mod sshconn;
 mod ui;

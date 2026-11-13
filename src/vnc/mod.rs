@@ -99,7 +99,7 @@ pub fn run_for_guest(terminal: &mut Term, app: &mut App, req: VncRequest) -> Res
     if req.vmid == 0 {
         bail!("invalid VM id");
     }
-    let title = format!("VM {} {}", req.vmid, req.name);
+    let title = format!("VM {} {}", req.vmid, crate::util::guest_name(&req.name));
     connecting(terminal, &format!("Connecting to the console of {title} on {}...", req.node));
     let conn = match (ctx.session.is_root() || ctx.session.rescue, ctx.exec_for(&req.node)) {
         (true, Some(exec)) if !ctx.remote => transport::qm_vncproxy(&exec, req.vmid)?,

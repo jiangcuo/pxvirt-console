@@ -353,7 +353,7 @@ impl Guests {
     fn power(&mut self, ctx: &mut Ctx, cmd: &str, label: &str) {
         let targets = self.targets();
         for g in targets {
-            let name = format!("{label} {} {}", js(&g, "vmid"), js(&g, "name"));
+            let name = format!("{label} {} {}", js(&g, "vmid"), gname(&g));
             ctx.api_call(name, "POST", format!("{}/status/{cmd}", Self::base(&g)), vec![]);
         }
         self.table.marked.clear();
@@ -580,7 +580,7 @@ impl View for Guests {
             }
         });
         match self.sort {
-            1 => list.sort_by_key(|g| js(g, "name").to_lowercase()),
+            1 => list.sort_by_key(|g| gname(g).to_lowercase()),
             2 => list.sort_by(|a, b| jf(b, "cpu").partial_cmp(&jf(a, "cpu")).unwrap_or(std::cmp::Ordering::Equal)),
             3 => list.sort_by(|a, b| jf(b, "mem").partial_cmp(&jf(a, "mem")).unwrap_or(std::cmp::Ordering::Equal)),
             4 => list.sort_by_key(|g| (js(g, "node"), ji(g, "vmid"))),
@@ -603,7 +603,7 @@ impl View for Guests {
                 Row::new(gkey(g))
                     .cs(if tmpl { "T" } else if running { "▲" } else { "▼" }, if running { style_good() } else if tmpl { style_dim() } else { style_bad() })
                     .c(js(g, "vmid"))
-                    .c(js(g, "name"))
+                    .c(gname(g))
                     .c(if js(g, "type") == "qemu" { "VM" } else { "CT" })
                     .cs(arch_short(&arch).to_string(), if foreign { style_warn() } else { style_dim() })
                     .cs(js(g, "node"), if js(g, "node") == ctx.node { Style::default() } else { style_dim() })
@@ -639,7 +639,7 @@ impl View for Guests {
             let (arch, foreign) = self.arch_of(&g, ctx);
             let is_vm = js(&g, "type") == "qemu";
             kv.add("ID", format!("{} ({})", js(&g, "vmid"), if is_vm { "QEMU VM" } else { "LXC container" }));
-            kv.add("Name", js(&g, "name"));
+            kv.add("Name", gname(&g));
             kv.add("Node", js(&g, "node"));
             kv.status("Status", js(&g, "status"));
             kv.styled(
@@ -679,7 +679,7 @@ impl View for Guests {
                     kv.add("Agent", js(c, "agent"));
                     kv.add("Boot", js(c, "boot"));
                 } else {
-                    kv.add("Hostname", js(c, "hostname"));
+                    kv.add("Hostname", crate::util::guest_name(&js(c, "hostname")));
                     kv.add("OS", js(c, "ostype"));
                     kv.add("Cores", js(c, "cores"));
                     kv.add("Memory", format!("{} MiB, swap {} MiB", js(c, "memory"), js(c, "swap")));
@@ -730,7 +730,7 @@ impl View for Guests {
         if t.len() > 1 {
             format!("{} ({} {})", tr("Actions"), t.len(), tr("Guests"))
         } else {
-            self.sel().map(|g| format!("{} {}", js(g, "vmid"), js(g, "name"))).unwrap_or_else(|| tr("Actions").into())
+            self.sel().map(|g| format!("{} {}", js(g, "vmid"), gname(g))).unwrap_or_else(|| tr("Actions").into())
         }
     }
 
@@ -827,24 +827,24 @@ impl View for Guests {
             return;
         };
         let id = js(&g, "vmid");
-        let name = js(&g, "name");
+        let name = gname(&g);
         let node = js(&g, "node");
         let is_vm = js(&g, "type") == "qemu";
         match key {
             's' => self.power(ctx, "start", "Start"),
             'd' => {
                 let t = self.targets();
-                ctx.popup(Popup::confirm("Shutdown", "shutdown", t.iter().map(|g| format!("{} {}", js(g, "vmid"), js(g, "name"))).collect(), false));
+                ctx.popup(Popup::confirm("Shutdown", "shutdown", t.iter().map(|g| format!("{} {}", js(g, "vmid"), gname(g))).collect(), false));
             }
             'D' => {
                 let t = self.targets();
-                let mut body: Vec<String> = t.iter().map(|g| format!("{} {}", js(g, "vmid"), js(g, "name"))).collect();
+                let mut body: Vec<String> = t.iter().map(|g| format!("{} {}", js(g, "vmid"), gname(g))).collect();
                 body.push("Hard stop: like pulling the power cord.".into());
                 ctx.popup(Popup::confirm("Stop (force)", "stop", body, true));
             }
             't' => {
                 let t = self.targets();
-                ctx.popup(Popup::confirm("Reboot", "reboot", t.iter().map(|g| format!("{} {}", js(g, "vmid"), js(g, "name"))).collect(), false));
+                ctx.popup(Popup::confirm("Reboot", "reboot", t.iter().map(|g| format!("{} {}", js(g, "vmid"), gname(g))).collect(), false));
             }
             'T' => ctx.popup(Popup::confirm("Reset (hard)", "reset", vec![format!("Hard reset {id} {name}?")], true)),
             'p' => self.power(ctx, "suspend", "Suspend"),
@@ -935,7 +935,7 @@ impl View for Guests {
                 let c = self.confs.get(&gkey(&g)).cloned().unwrap_or(Value::Null);
                 let fields = if is_vm {
                     vec![
-                        form::text("name", "Name", &js(&c, "name")),
+                        form::text("name", "Name", &crate::util::guest_name(&js(&c, "name"))),
                         form::number("sockets", "Sockets", &jsd(&c, "sockets", "1")),
                         form::number("cores", "Cores", &jsd(&c, "cores", "1")),
                         form::number("memory", "Memory (MiB)", &jsd(&c, "memory", "512")),
@@ -945,7 +945,7 @@ impl View for Guests {
                     ]
                 } else {
                     vec![
-                        form::text("hostname", "Hostname", &js(&c, "hostname")),
+                        form::text("hostname", "Hostname", &crate::util::guest_name(&js(&c, "hostname"))),
                         form::number("cores", "Cores", &jsd(&c, "cores", "1")),
                         form::number("memory", "Memory (MiB)", &js(&c, "memory")),
                         form::number("swap", "Swap (MiB)", &js(&c, "swap")),
@@ -1060,7 +1060,7 @@ impl View for Guests {
             "clone" => {
                 let mut p = vec![("newid", fv(v, "newid").to_string()), ("target", fv(v, "target").to_string())];
                 if !fv(v, "name").is_empty() {
-                    p.push((if is_vm { "name" } else { "hostname" }, fv(v, "name").to_string()));
+                    p.push((if is_vm { "name" } else { "hostname" }, crate::util::guest_name_encode(fv(v, "name"))));
                 }
                 if fv(v, "full") == "1" {
                     p.push(("full", "1".into()));
@@ -1078,6 +1078,8 @@ impl View for Guests {
                     let val = fv(v, k);
                     if val.is_empty() {
                         del.push(*k);
+                    } else if matches!(*k, "name" | "hostname") {
+                        p.push((k, crate::util::guest_name_encode(val)));
                     } else {
                         p.push((k, val.to_string()));
                     }
@@ -1833,4 +1835,9 @@ impl View for Replication {
     fn reset(&mut self) {
         self.data.clear();
     }
+}
+
+/// Display name of a guest (punycode decoded).
+fn gname(g: &Value) -> String {
+    crate::util::guest_name(&js(g, "name"))
 }

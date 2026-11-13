@@ -274,3 +274,27 @@ mod tests {
         assert_eq!(urlenc("PVE:root@pam:1"), "PVE%3Aroot%40pam%3A1");
     }
 }
+
+/// PVE guest names are DNS names; non-ASCII names are stored punycoded (`xn--...`).
+pub fn guest_name(raw: &str) -> String {
+    crate::punycode::decode_vm_name(raw)
+}
+
+/// Encode a user-entered guest name / hostname for PVE (non-ASCII labels -> `xn--`).
+pub fn guest_name_encode(name: &str) -> String {
+    crate::punycode::encode_domain(name.trim())
+}
+
+#[cfg(test)]
+mod guest_name_tests {
+    use super::*;
+
+    #[test]
+    fn guest_name_round_trip() {
+        for s in ["中文", "开发-win10", "web-01", "测试.lab"] {
+            assert_eq!(guest_name(&guest_name_encode(s)), s);
+        }
+        assert_eq!(guest_name_encode("web-01"), "web-01");
+        assert_eq!(guest_name("Copy-of-VM-xn--fiq228c"), "Copy-of-VM-中文");
+    }
+}

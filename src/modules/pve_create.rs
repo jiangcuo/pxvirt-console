@@ -135,7 +135,7 @@ pub fn submit(tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
         let bus = fv(v, "bus").to_string();
         let mut p: Vec<(&'static str, String)> = vec![
             ("vmid", fv(v, "vmid").into()),
-            ("name", fv(v, "name").into()),
+            ("name", crate::util::guest_name_encode(fv(v, "name"))),
             ("ostype", fv(v, "ostype").into()),
             ("sockets", fv(v, "sockets").into()),
             ("cores", fv(v, "cores").into()),
@@ -208,7 +208,7 @@ pub fn submit(tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
         }
         let mut p: Vec<(&'static str, String)> = vec![
             ("vmid", fv(v, "vmid").into()),
-            ("hostname", fv(v, "hostname").into()),
+            ("hostname", crate::util::guest_name_encode(fv(v, "hostname"))),
             ("password", fv(v, "password").into()),
             ("ostemplate", fv(v, "template").into()),
             ("rootfs", format!("{storage}:{}", fv(v, "disksize"))),
