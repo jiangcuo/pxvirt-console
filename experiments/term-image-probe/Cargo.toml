@@ -1,0 +1,13 @@
+[package]
+name = "term-image-probe"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"

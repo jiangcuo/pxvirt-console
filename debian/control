@@ -3,13 +3,17 @@ Priority: optional
 Maintainer: Lierfang Team <itsupport@lierfang.com>
 Build-Depends: debhelper (>= 11),
                pkg-config,
-               libclang-dev
+               libclang-dev,
+               libsdl2-dev
 Standards-Version: 4.1.3
 Section: libs
 
 Package: pxvirt-console
 Section: optional
 Architecture: any
-Description: pxvirt-console
-Depends: ${misc:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: PXVIRT direct console user interface
+ Text-mode console for PXVIRT/PVE nodes (tty1 and ssh): system, network,
+ disks, services/logs and PVE cluster management, rescue tools and a
+ graphical VM console (SDL2/KMSDRM or terminal graphics).
 

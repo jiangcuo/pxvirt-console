@@ -1,0 +1,18 @@
+# Copy to /etc/pxvirt-console/config.toml to change the defaults.
+
+# Lock the console after this many seconds without a key press.
+idle_timeout_secs = 900
+# "auto", "en" or "zh". tty1 (TERM=linux) always uses English.
+lang = "auto"
+# Minimum auto-refresh interval of the active page (seconds).
+refresh_secs = 5
+# Show host name, management URL and live metrics before login.
+prelogin_dashboard = true
+# Realm preselected on the login screen.
+default_realm = "pam"
+# Graphical VM console: "auto" (SDL on tty1, terminal graphics elsewhere), "sdl" or "terminal".
+console_display = "auto"
+# Frame rate limit of the terminal VNC renderer.
+console_fps = 10
+# User for host commands over ssh in remote mode (--ssh).
+ssh_user = "root"

@@ -31,3 +31,4 @@ override_dh_auto_install:
 	install -m 755 $(TARGET_DIR)/$(TARGET)/release/pxvirt-console $(CURDIR)/debian/pxvirt-console/usr/sbin/
 	install -d $(CURDIR)/debian/pxvirt-console/usr/share/pxvirt-console/
 	install -m 644 $(CURDIR)/debian/pxvirt-console.service $(CURDIR)/debian/pxvirt-console/usr/share/pxvirt-console/
+	install -m 644 $(CURDIR)/debian/config.toml.example $(CURDIR)/debian/pxvirt-console/usr/share/pxvirt-console/

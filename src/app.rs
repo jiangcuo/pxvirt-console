@@ -1,1188 +1,1563 @@
-use crossterm::event::KeyCode;
-use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
+//! Application state, key routing, layout and the main frame.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ROOT_USERNAME: &str = "root";
-pub const SESSION_IDLE_TIMEOUT_SECS: u64 = 60;
-const LOGIN_LOCK_THRESHOLD: usize = 3;
-const LOGIN_LOCKOUT_SECS: u64 = 60;
-
-#[derive(Clone, PartialEq)]
-pub enum Screen {
-    Login,
-    Main,
-    ResetPassword,
-    Network,
-    NetworkPing,
-    NetworkReset,
-    NetworkSelectIface,
-    NetworkConfigIP,
-    NetworkReview,
-    RestartService,
-    ServiceConfirm(usize),
-}
-
-pub enum NetworkResetTaskResult {
-    Interfaces(Vec<NetIface>),
-    Applied,
-}
+use crate::api::{self, Api};
+use crate::config::Config;
+use crate::ctx::{ActionOutcome, Cmd, Ctx, Session, Suspend, VncRequest};
+use crate::i18n::{self, tr};
+use crate::loader::{Job, Loader};
+use crate::login::{self, HostInfo, Login, LoginEvent, SessionInit};
+use crate::metrics::{Metrics, MetricsData, Target};
+use crate::modules::{build_modules, Module};
+use crate::ui::popup::{item, MenuItem, Outcome, Popup};
+use crate::ui::task::TaskView;
+use crate::ui::{self, hint_spans, hsplit, sparkline, style_bad, usage_style, vsplit, ACCENT};
+use crate::util::{fmt_bytes, fmt_rate, jarr, jf, js};
 
 pub const APP_VERSION: &str = env!("APP_VERSION");
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Focus {
+    List,
+    Detail,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    View(usize, usize),
+    Global,
+}
+
+#[derive(PartialEq)]
+enum Screen {
+    Dashboard,
+    Login,
+    Main,
+}
+
+pub struct RemoteTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+/// SSH mode connection (established before the TUI starts).
+pub struct SshTarget {
+    pub target: String,
+    pub label: String,
+    pub node: String,
+    pub api_port: u16,
+    pub user: String,
+}
+
 pub struct App {
-    pub screen: Screen,
-    pub main_index: usize,
-    pub service_index: usize,
+    pub ctx: Ctx,
+    modules: Vec<Module>,
+    cur: usize,
+    focus: Focus,
+    popups: Vec<(Popup, Origin)>,
+    filter_edit: bool,
+    toast: Option<(String, bool, Instant)>,
+    actions: Vec<(String, Job<ActionOutcome>, Origin)>,
+    bg_tasks: Vec<(TaskView, Origin)>,
+    pub metrics: Metrics,
+    last_refresh: HashMap<(usize, usize), Instant>,
+    auto_refresh: bool,
+    last_activity: Instant,
     pub should_exit: bool,
-
-    // System info
-    pub pve_version: String,
-    pub hostname: String,
-    pub kernel_version: String,
-
-    // Login
-    pub login_password: String,
-    pub login_attempts: usize,
-    pub login_checking: bool,
-    pub login_rx: Option<mpsc::Receiver<bool>>,
-    login_locked_until: Option<Instant>,
-
-    // Password form
-    pub password_field: usize, // 0=username, 1=password, 2=confirm
-    pub username: String,
-    pub password: String,
-    pub password_confirm: String,
-
-    // Services
-    pub services: Vec<Service>,
-    pub service_restart_status: Option<String>,
-    pub service_restart_rx: Option<mpsc::Receiver<Result<(), String>>>,
-
-    // Network
-    pub network_info: NetworkInfo,
-    pub network_draft: NetworkInfo,
-    pub network_ifaces: Vec<NetIface>,
-    pub network_index: usize,
-    pub ping_target: String,
-    pub ping_result: Option<String>,
-    pub ping_running: bool,
-    pub ping_rx: Option<mpsc::Receiver<String>>,
-
-    // Network reset async
-    pub network_reset_status: Option<String>,
-    pub network_reset_rx: Option<mpsc::Receiver<Result<NetworkResetTaskResult, String>>>,
-
-    // Message
-    pub message: Option<(String, bool)>, // (msg, is_success)
-
-    // Shell
-    pub enter_shell: bool,
-    last_activity_at: Instant,
-}
-
-pub struct Service {
-    pub name: String,
-    pub display: String,
-    pub running: bool,
-}
-
-#[derive(Clone, Default)]
-pub struct NetworkInfo {
-    pub ip: String,
-    pub netmask: String,
-    pub gateway: String,
-    pub iface: String,
-}
-
-#[derive(Clone)]
-pub struct NetIface {
-    pub name: String,
-    pub mac: String,
-    pub has_carrier: bool,
+    pub pending_suspend: Option<Suspend>,
+    pub pending_vnc: Option<VncRequest>,
+    screen: Screen,
+    login: Login,
+    host: HostInfo,
+    host_at: Instant,
+    cluster: String,
+    remote: Option<RemoteTarget>,
+    alerts: Loader<Vec<String>>,
+    renew: Option<Job<()>>,
+    last_renew_check: Instant,
+    recover: Option<Job<Arc<Api>>>,
+    last_recover: Instant,
+    narrow_detail: bool,
+    width: u16,
+    arch_job: Option<Job<(String, String)>>,
+    /// Quitting is allowed in ssh / terminal emulators, not on tty1 or a serial console.
+    pub can_quit: bool,
+    /// "Quit pxvirt-console?" is showing (works on every screen).
+    confirm_quit: bool,
+    ssh: Option<SshTarget>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(cfg: Config, remote: Option<RemoteTarget>, ssh: Option<SshTarget>) -> Self {
+        i18n::init(&cfg.lang);
+        let mut trust = None;
+        let api = match (&remote, &ssh) {
+            // the API is reached through the ssh port forward; trust comes from the ssh host key
+            (_, Some(t)) => Arc::new(Api::http("127.0.0.1", t.api_port, None)),
+            (Some(r), None) => {
+                let fp = api::known_fingerprint(&r.host);
+                if fp.is_none() {
+                    trust = api::probe_fingerprint(&r.host, r.port).ok();
+                }
+                Arc::new(Api::http(&r.host, r.port, fp))
+            }
+            (None, None) => Arc::new(Api::local()),
+        };
+        let local_mode = remote.is_none() && ssh.is_none();
+        let local_node = match (&remote, &ssh) {
+            (_, Some(t)) => Some(t.node.clone()),
+            (Some(_), None) => None,
+            (None, None) => Some(crate::util::local_hostname()),
+        };
+        let metrics = Metrics::new();
+        let ctx = Ctx {
+            metrics: metrics.data.clone(),
+            api: api.clone(),
+            session: Session::default(),
+            node: local_node.clone().unwrap_or_default(),
+            nodes: Vec::new(),
+            local_node,
+            remote: remote.is_some() && ssh.is_none(),
+            ssh: ssh.as_ref().map(|t| t.target.clone()),
+            cmds: Vec::new(),
+            node_arch: HashMap::new(),
+            cfg: cfg.clone(),
+        };
+        let login = Login::new(api, !local_mode, &cfg.default_realm, trust);
+        let screen = if local_mode && cfg.prelogin_dashboard {
+            metrics.start(Target::Local);
+            Screen::Dashboard
+        } else {
+            Screen::Login
+        };
         Self {
-            screen: Screen::Login,
-            main_index: 0,
-            service_index: 0,
+            ctx,
+            modules: build_modules(),
+            cur: 0,
+            focus: Focus::List,
+            popups: Vec::new(),
+            filter_edit: false,
+            toast: None,
+            actions: Vec::new(),
+            bg_tasks: Vec::new(),
+            metrics,
+            last_refresh: HashMap::new(),
+            auto_refresh: true,
+            last_activity: Instant::now(),
             should_exit: false,
-            pve_version: get_pve_version(),
-            hostname: get_hostname(),
-            kernel_version: get_kernel_version(),
-            login_password: String::new(),
-            login_attempts: 0,
-            login_checking: false,
-            login_rx: None,
-            login_locked_until: None,
-            password_field: 0,
-            username: ROOT_USERNAME.to_string(),
-            password: String::new(),
-            password_confirm: String::new(),
-            services: get_services(),
-            service_restart_status: None,
-            service_restart_rx: None,
-            network_info: get_network_info(),
-            network_draft: NetworkInfo::default(),
-            network_ifaces: Vec::new(),
-            network_index: 0,
-            ping_target: String::new(),
-            ping_result: None,
-            ping_running: false,
-            ping_rx: None,
-            network_reset_status: None,
-            network_reset_rx: None,
-            message: None,
-            enter_shell: false,
-            last_activity_at: Instant::now(),
+            pending_suspend: None,
+            pending_vnc: None,
+            screen,
+            login,
+            host: if local_mode { login::host_info() } else { HostInfo::default() },
+            host_at: Instant::now(),
+            cluster: String::new(),
+            remote,
+            alerts: Loader::default(),
+            renew: None,
+            last_renew_check: Instant::now(),
+            recover: None,
+            last_recover: Instant::now(),
+            narrow_detail: false,
+            width: 120,
+            arch_job: None,
+            can_quit: !crate::util::on_system_console(),
+            confirm_quit: false,
+            ssh,
+        }
+    }
+
+    /// SSH mode: connected as root -> create a root@pam ticket on the node, skip the login form.
+    pub fn ssh_auto_login(&mut self) -> anyhow::Result<()> {
+        let Some(t) = &self.ssh else { return Ok(()) };
+        if t.user != "root" {
+            return Ok(());
+        }
+        let exec = crate::exec::Exec::Ssh(t.target.clone());
+        let auth = api::forge_root_auth_with(&exec)?;
+        self.ctx.api.set_auth(auth);
+        let init = login::init_session(self.ctx.api.clone(), false)?;
+        self.start_session(init);
+        Ok(())
+    }
+
+    /// Debug helper: log in as root@pam with a locally created ticket (root only).
+    pub fn debug_login_root(&mut self) -> anyhow::Result<()> {
+        let api = Arc::new(Api::local());
+        api.set_auth(api::forge_root_auth()?);
+        let init = login::init_session(api, false)?;
+        self.start_session(init);
+        Ok(())
+    }
+
+    /// Debug helper: render the current screen as text.
+    pub fn debug_render(&mut self, w: u16, h: u16) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test backend");
+        let _ = t.draw(|f| self.draw(f));
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Debug helper: render the current screen as HTML (with colors) for visual review.
+    pub fn debug_render_html(&mut self, w: u16, h: u16) -> String {
+        use ratatui::style::Color as C;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test backend");
+        let _ = t.draw(|f| self.draw(f));
+        let buf = t.backend().buffer().clone();
+        let col = |c: C, fg: bool| -> &'static str {
+            match c {
+                C::Black => "#000000",
+                C::Red => "#cd3131",
+                C::Green => "#0dbc79",
+                C::Yellow => "#e5e510",
+                C::Blue => "#2472c8",
+                C::Magenta => "#bc3fbc",
+                C::Cyan => "#11a8cd",
+                C::Gray => "#cccccc",
+                C::DarkGray => "#767676",
+                C::White => "#ffffff",
+                _ => if fg { "#222222" } else { "#ffffff" },
+            }
+        };
+        let mut out = String::from("<html><head><meta charset='utf-8'></head><body style='margin:0;background:#fff'><pre style='font:13px/1.25 \"Noto Sans Mono CJK SC\",monospace;margin:8px'>");
+        for y in 0..h {
+            let mut skip = 0;
+            for x in 0..w {
+                let c = &buf[(x, y)];
+                let sym = c.symbol();
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                if sym.is_empty() {
+                    continue;
+                }
+                skip = ui::unicode_width(sym).saturating_sub(1);
+                let bold = if c.modifier.contains(ratatui::style::Modifier::BOLD) { "font-weight:bold;" } else { "" };
+                let ul = if c.modifier.contains(ratatui::style::Modifier::UNDERLINED) { "text-decoration:underline;" } else { "" };
+                let esc = sym.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                out.push_str(&format!("<span style='color:{};background:{};{bold}{ul}'>{esc}</span>", col(c.fg, true), col(c.bg, false)));
+            }
+            out.push('\n');
+        }
+        out.push_str("</pre></body></html>");
+        out
+    }
+
+    /// Debug helper: render every view into text files (sizes WxH).
+    pub fn debug_dump(&mut self, dir: &str, sizes: &[(u16, u16)]) -> anyhow::Result<()> {
+        use ratatui::backend::TestBackend;
+        std::fs::create_dir_all(dir)?;
+        let dump = |app: &mut App, name: &str| -> anyhow::Result<()> {
+            for (w, h) in sizes {
+                let mut t = ratatui::Terminal::new(TestBackend::new(*w, *h))?;
+                t.draw(|f| app.draw(f))?;
+                let buf = t.backend().buffer().clone();
+                let mut out = String::new();
+                for y in 0..*h {
+                    for x in 0..*w {
+                        out.push_str(buf[(x, y)].symbol());
+                    }
+                    out.push('\n');
+                }
+                std::fs::write(format!("{dir}/{name}_{w}x{h}.txt"), out)?;
+                if *w == 110 {
+                    std::fs::write(format!("{dir}/{name}.html"), app.debug_render_html(*w, *h))?;
+                }
+            }
+            Ok(())
+        };
+        let settle = |app: &mut App, ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            let mut t = ratatui::Terminal::new(TestBackend::new(160, 45)).expect("test backend");
+            while Instant::now() < end {
+                app.tick();
+                let _ = t.draw(|f| app.draw(f));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        for m in 0..self.modules.len() {
+            for v in 0..self.modules[m].views.len() {
+                self.goto(m, v);
+                settle(self, 3000);
+                let name = format!("{}_{}_{}", m + 1, v + 1, self.modules[m].views[v].title().replace([' ', '/', '&'], ""));
+                dump(self, &name)?;
+                // context menu
+                self.open_context_menu();
+                if !self.popups.is_empty() {
+                    dump(self, &format!("{name}_menu"))?;
+                    self.popups.clear();
+                }
+            }
+        }
+        self.open_global_menu();
+        dump(self, "global_menu")?;
+        self.popups.clear();
+        self.open_help();
+        dump(self, "help")?;
+        self.popups.clear();
+        Ok(())
+    }
+
+    fn host_label(&self) -> String {
+        if let Some(t) = &self.ssh {
+            return t.node.clone();
+        }
+        match &self.remote {
+            Some(r) => r.host.clone(),
+            None => self.host.hostname.clone(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // session lifecycle
+    // -----------------------------------------------------------------------
+
+    fn start_session(&mut self, init: SessionInit) {
+        self.ctx.api = init.api.clone();
+        self.ctx.session = init.session;
+        self.ctx.nodes = init.nodes;
+        self.cluster = init.cluster;
+        if self.ctx.local_node.is_none() || self.ctx.node_info(self.ctx.local_node.as_deref().unwrap_or("")).is_none() {
+            // remote mode, or this host is not (yet) a PVE node name we know
+            if let Some(n) = self.ctx.nodes.iter().find(|n| n.local).or_else(|| self.ctx.nodes.first()) {
+                self.ctx.node = n.name.clone();
+            }
+        } else {
+            self.ctx.node = self.ctx.local_node.clone().unwrap_or_default();
+        }
+        self.modules = build_modules();
+        if self.ctx.remote {
+            for m in &mut self.modules {
+                m.views.retain(|v| !v.needs_host());
+            }
+        }
+        self.cur = 0;
+        self.focus = Focus::List;
+        self.popups.clear();
+        self.screen = Screen::Main;
+        self.last_refresh.clear();
+        self.last_activity = Instant::now();
+        self.start_metrics();
+        self.fetch_arch();
+        self.alerts.clear();
+        crate::audit(&self.ctx.session.user, &self.ctx.node, if self.ctx.session.rescue { "login (rescue mode)" } else { "login" });
+        if self.ctx.session.rescue {
+            self.toast(tr("RESCUE MODE: PVE API unreachable, local root access only").to_string(), true);
+        }
+        self.refresh_current(true);
+    }
+
+    /// Learn the architecture of the viewed node (shown in the header).
+    fn fetch_arch(&mut self) {
+        if self.ctx.node.is_empty() || self.ctx.node_arch.contains_key(&self.ctx.node) {
+            return;
+        }
+        let api = self.ctx.api.clone();
+        let node = self.ctx.node.clone();
+        self.arch_job = Some(Job::spawn(move || {
+            let s = api.get(&format!("/nodes/{node}/status"))?;
+            let a = s.get("current-kernel").map(|k| js(k, "machine")).unwrap_or_default();
+            Ok((node, crate::modules::pve::arch_norm(&a)))
+        }));
+    }
+
+    fn start_metrics(&self) {
+        if self.ssh.is_some() {
+            match self.ctx.exec() {
+                Some(e) => self.metrics.start(Target::Exec(e)),
+                None => self.metrics.start(Target::Api(self.ctx.api.clone(), self.ctx.node.clone())),
+            }
+        } else if self.ctx.is_local_node() {
+            self.metrics.start(Target::Local);
+        } else if self.ctx.node.is_empty() {
+            self.metrics.start(Target::None);
+        } else {
+            self.metrics.start(Target::Api(self.ctx.api.clone(), self.ctx.node.clone()));
         }
     }
 
     pub fn logout(&mut self) {
-        self.clear_secret_fields();
-        self.screen = Screen::Login;
-        self.main_index = 0;
-        self.service_index = 0;
-        self.login_password.clear();
-        self.login_attempts = 0;
-        self.login_checking = false;
-        self.login_rx = None;
-        self.login_locked_until = None;
-        self.service_restart_status = None;
-        self.service_restart_rx = None;
-        self.network_draft = NetworkInfo::default();
-        self.network_ifaces.clear();
-        self.network_index = 0;
-        self.ping_result = None;
-        self.ping_running = false;
-        self.ping_rx = None;
-        self.network_reset_status = None;
-        self.network_reset_rx = None;
-        self.enter_shell = false;
-        self.message = None;
-        self.last_activity_at = Instant::now();
+        if self.screen == Screen::Main {
+            crate::audit(&self.ctx.session.user, &self.ctx.node, "logout");
+        }
+        if self.ssh.is_some() {
+            // SSH mode: logging out = disconnecting
+            self.should_exit = true;
+            return;
+        }
+        self.ctx.api.clear_auth();
+        self.ctx.session = Session::default();
+        self.modules = build_modules();
+        self.popups.clear();
+        self.actions.clear();
+        self.bg_tasks.clear();
+        self.filter_edit = false;
+        self.login.reset();
+        // back to the local HTTP API (rescue sessions used pvesh)
+        if self.remote.is_none() {
+            let api = Arc::new(Api::local());
+            self.ctx.api = api.clone();
+            self.login.set_api(api);
+            self.ctx.node = self.ctx.local_node.clone().unwrap_or_default();
+        }
+        if self.remote.is_none() && self.ctx.cfg.prelogin_dashboard {
+            self.metrics.start(Target::Local);
+            self.screen = Screen::Dashboard;
+        } else {
+            self.metrics.start(Target::None);
+            self.screen = Screen::Login;
+        }
+    }
+
+    fn switch_node(&mut self, node: String) {
+        if node == self.ctx.node {
+            return;
+        }
+        self.ctx.node = node;
+        for m in &mut self.modules {
+            for v in &mut m.views {
+                v.reset();
+            }
+        }
+        self.last_refresh.clear();
+        self.start_metrics();
+        self.fetch_arch();
+        self.alerts.clear();
+        self.refresh_current(true);
+        self.toast(format!("{}: {}", tr("node"), self.ctx.node), false);
+    }
+
+    fn toast(&mut self, msg: String, err: bool) {
+        self.toast = Some((msg, err, Instant::now()));
     }
 
     pub fn note_activity(&mut self) {
-        self.last_activity_at = Instant::now();
+        self.last_activity = Instant::now();
     }
 
-    pub fn poll_session_timeout(&mut self) {
-        if matches!(self.screen, Screen::Login) {
-            return;
+    // -----------------------------------------------------------------------
+    // ticking
+    // -----------------------------------------------------------------------
+
+    pub fn tick(&mut self) {
+        match self.screen {
+            Screen::Dashboard => {
+                if self.host_at.elapsed() > Duration::from_secs(30) {
+                    self.host = login::host_info();
+                    self.host_at = Instant::now();
+                }
+                return;
+            }
+            Screen::Login => {
+                if let Some(init) = self.login.tick() {
+                    self.start_session(init);
+                }
+                if self.remote.is_none() && !self.login.busy() && self.last_activity.elapsed() > Duration::from_secs(120) && self.ctx.cfg.prelogin_dashboard {
+                    self.login.reset();
+                    self.screen = Screen::Dashboard;
+                }
+                return;
+            }
+            Screen::Main => {}
         }
 
-        if self.last_activity_at.elapsed() >= Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS) {
+        if self.last_activity.elapsed() >= Duration::from_secs(self.ctx.cfg.idle_timeout_secs.max(30)) {
             self.logout();
+            return;
         }
-    }
 
-    pub fn login_lock_remaining_secs(&self) -> Option<u64> {
-        let now = Instant::now();
-        self.login_locked_until
-            .and_then(|until| until.checked_duration_since(now))
-            .map(|remaining| remaining.as_secs().max(1))
-    }
+        for (p, _) in &mut self.popups {
+            p.tick();
+        }
+        // countdown confirms answer themselves when time runs out
+        if let Some(tag) = self.popups.last().and_then(|(p, _)| p.expired()) {
+            if let Some((_, origin)) = self.popups.pop() {
+                if let Origin::View(m, v) = origin {
+                    self.modules[m].views[v].on_confirm(&tag, &mut self.ctx);
+                    self.process_cmds(origin);
+                }
+            }
+        }
 
-    pub fn poll_login(&mut self) {
-        if let Some(rx) = &self.login_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.login_checking = false;
-                self.login_rx = None;
-                if result {
-                    self.screen = Screen::Main;
-                    self.login_attempts = 0;
-                    self.login_locked_until = None;
-                    self.note_activity();
-                } else {
-                    self.login_attempts = self.login_attempts.saturating_add(1);
-                    if self.login_attempts >= LOGIN_LOCK_THRESHOLD {
-                        self.login_locked_until =
-                            Some(Instant::now() + Duration::from_secs(LOGIN_LOCKOUT_SECS));
-                        self.message = Some((
-                            format!(
-                                "Invalid password (attempt {}). Login locked for {}s",
-                                self.login_attempts, LOGIN_LOCKOUT_SECS
-                            ),
-                            false,
-                        ));
-                        self.login_attempts = 0;
-                    } else {
-                        let remaining = LOGIN_LOCK_THRESHOLD - self.login_attempts;
-                        self.message = Some((
-                            format!(
-                                "Invalid password (attempt {}/{}). {} more wrong attempt(s) will lock login for {}s",
-                                self.login_attempts,
-                                LOGIN_LOCK_THRESHOLD,
-                                remaining,
-                                LOGIN_LOCKOUT_SECS
-                            ),
-                            false,
-                        ));
+        // background tasks
+        let mut finished = Vec::new();
+        for (i, (t, _)) in self.bg_tasks.iter_mut().enumerate() {
+            t.tick();
+            if t.done {
+                finished.push(i);
+            }
+        }
+        for i in finished.into_iter().rev() {
+            let (t, origin) = self.bg_tasks.remove(i);
+            let ok = t.ok();
+            self.toast(format!("{}: {}", t.title, if ok { "OK" } else { "failed" }), !ok);
+            self.refresh_origin(origin);
+        }
+
+        // finished actions
+        let mut i = 0;
+        while i < self.actions.len() {
+            if let Some(r) = self.actions[i].1.poll() {
+                let (title, _, origin) = self.actions.remove(i);
+                match r {
+                    Ok(ActionOutcome::Upid(upid)) => {
+                        let node = api::upid_node(&upid).unwrap_or_else(|| self.ctx.node.clone());
+                        let tv = TaskView::new(self.ctx.api.clone(), &node, &upid, &title);
+                        self.popups.push((Popup::Task(Box::new(tv)), origin));
                     }
-                }
-            }
-        }
-    }
-
-    pub fn main_menu_items() -> Vec<&'static str> {
-        vec![
-            "Reset Password",
-            "Reset Network",
-            "Restart Service",
-            "Enter Shell",
-        ]
-    }
-
-    pub fn pending_network_config_preview(&self) -> Result<String, String> {
-        if self.network_draft.iface.is_empty() {
-            return Err("No interface selected".to_string());
-        }
-
-        validate_network_config(&self.network_draft)?;
-        Ok(build_network_config(&self.network_draft.iface, &self.network_draft))
-    }
-
-    pub fn handle_key(&mut self, key: KeyCode) {
-        // If message is showing, any key clears it and returns
-        if self.message.is_some() {
-            self.message = None;
-            return;
-        }
-
-        match &self.screen {
-            Screen::Login => self.handle_login(key),
-            Screen::Main => self.handle_main(key),
-            Screen::ResetPassword => self.handle_password(key),
-            Screen::Network => self.handle_network(key),
-            Screen::NetworkPing => self.handle_network_ping(key),
-            Screen::NetworkReset
-            | Screen::NetworkSelectIface
-            | Screen::NetworkConfigIP
-            | Screen::NetworkReview => {
-                self.handle_network_reset(key);
-            }
-            Screen::RestartService => self.handle_service_list(key),
-            Screen::ServiceConfirm(idx) => {
-                let idx = *idx;
-                self.handle_service_confirm(key, idx);
-            }
-        }
-    }
-
-    fn handle_login(&mut self, key: KeyCode) {
-        if let Some(remaining) = self.login_lock_remaining_secs() {
-            match key {
-                KeyCode::Enter => {
-                    self.message = Some((
-                        format!("Too many failed attempts. Login is locked for {}s", remaining),
-                        false,
-                    ));
-                }
-                KeyCode::Char(_) | KeyCode::Backspace => {}
-                #[cfg(debug_assertions)]
-                KeyCode::Esc => {
-                    self.should_exit = true;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        match key {
-            KeyCode::Char(c) => {
-                self.login_password.push(c);
-            }
-            KeyCode::Backspace => {
-                self.login_password.pop();
-            }
-            KeyCode::Enter => {
-                if !self.login_checking {
-                    if let Some(remaining) = self.login_lock_remaining_secs() {
-                        self.message = Some((
-                            format!("Too many failed attempts. Try again in {}s", remaining),
-                            false,
-                        ));
-                        return;
+                    Ok(ActionOutcome::Msg(m)) => {
+                        self.toast(m, false);
+                        self.refresh_origin(origin);
                     }
-
-                    let mut password = std::mem::take(&mut self.login_password);
-                    if password.is_empty() {
-                        self.message = Some(("Password cannot be empty".to_string(), false));
-                        return;
-                    }
-
-                    let (tx, rx) = mpsc::channel();
-                    self.login_rx = Some(rx);
-                    self.login_checking = true;
-                    thread::spawn(move || {
-                        let ok = matches!(pwcheck::pwcheck("root", &password), pwcheck::PwcheckResult::Ok);
-                        scrub_string(&mut password);
-                        let _ = tx.send(ok);
-                    });
-                }
-            }
-            #[cfg(debug_assertions)]
-            KeyCode::Esc => {
-                self.should_exit = true;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_main(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Up => {
-                if self.main_index > 0 {
-                    self.main_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                let max = Self::main_menu_items().len() - 1;
-                if self.main_index < max {
-                    self.main_index += 1;
-                }
-            }
-            KeyCode::Enter | KeyCode::Right => match self.main_index {
-                0 => {
-                    self.username = ROOT_USERNAME.to_string();
-                    self.clear_password_form();
-                    self.screen = Screen::ResetPassword;
-                }
-                1 => {
-                    self.network_info = get_network_info();
-                    self.network_draft = NetworkInfo::default();
-                    self.network_ifaces.clear();
-                    self.network_index = 0;
-                    self.ping_target = self.network_info.gateway.clone();
-                    self.screen = Screen::Network;
-                }
-                2 => {
-                    self.services = get_services();
-                    self.service_index = 0;
-                    self.screen = Screen::RestartService;
-                }
-                3 => {
-                    self.enter_shell = true;
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-
-    fn handle_password(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc | KeyCode::Left => {
-                self.clear_password_form();
-                self.screen = Screen::Main;
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                self.password_field = (self.password_field + 1) % 3;
-            }
-            KeyCode::Up => {
-                self.password_field = if self.password_field == 0 { 2 } else { self.password_field - 1 };
-            }
-            KeyCode::Char(c) => match self.password_field {
-                0 => {}
-                1 => self.password.push(c),
-                2 => self.password_confirm.push(c),
-                _ => {}
-            },
-            KeyCode::Backspace => match self.password_field {
-                0 => {}
-                1 => { self.password.pop(); }
-                2 => { self.password_confirm.pop(); }
-                _ => {}
-            },
-            KeyCode::Enter => {
-                self.submit_password();
-            }
-            _ => {}
-        }
-    }
-
-    fn submit_password(&mut self) {
-        self.username = ROOT_USERNAME.to_string();
-        let mut password = std::mem::take(&mut self.password);
-        let mut password_confirm = std::mem::take(&mut self.password_confirm);
-
-        if password.is_empty() {
-            scrub_string(&mut password_confirm);
-            self.message = Some(("Password cannot be empty".to_string(), false));
-            return;
-        }
-        if password != password_confirm {
-            scrub_string(&mut password);
-            scrub_string(&mut password_confirm);
-            self.message = Some(("Passwords do not match".to_string(), false));
-            return;
-        }
-        scrub_string(&mut password_confirm);
-
-        // Use chpasswd to change password
-        let mut input = format!("{}:{}", self.username, password);
-        let result = Command::new("chpasswd")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(input.as_bytes())?;
-                }
-                child.wait()
-            });
-        scrub_string(&mut input);
-        scrub_string(&mut password);
-
-        match result {
-            Ok(status) if status.success() => {
-                self.message = Some((format!("Password for '{}' has been reset", self.username), true));
-                self.screen = Screen::Main;
-            }
-            _ => {
-                self.message = Some(("Failed to reset password (need root?)".to_string(), false));
-            }
-        }
-    }
-
-    fn handle_service_list(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc | KeyCode::Left => {
-                self.screen = Screen::Main;
-            }
-            KeyCode::Up => {
-                if self.service_index > 0 {
-                    self.service_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                // +1 for "Restart All" option
-                if self.service_index < self.services.len() {
-                    self.service_index += 1;
-                }
-            }
-            KeyCode::Enter | KeyCode::Right => {
-                self.screen = Screen::ServiceConfirm(self.service_index);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_network(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc | KeyCode::Left => {
-                self.screen = Screen::Main;
-            }
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                self.screen = Screen::NetworkPing;
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.screen = Screen::NetworkReset;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_network_ping(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc | KeyCode::Left => {
-                self.ping_result = None;
-                self.screen = Screen::Network;
-            }
-            KeyCode::Char(c) => {
-                if !self.ping_running {
-                    self.ping_target.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if !self.ping_running {
-                    self.ping_target.pop();
-                }
-            }
-            KeyCode::Enter => {
-                if !self.ping_running && !self.ping_target.is_empty() {
-                    let target = self.ping_target.clone();
-                    let (tx, rx) = mpsc::channel();
-                    self.ping_rx = Some(rx);
-                    self.ping_running = true;
-                    self.ping_result = Some("Pinging...".to_string());
-                    thread::spawn(move || {
-                        let output = Command::new("ping")
-                            .args(["-c", "4", &target])
-                            .output();
-                        let result = match output {
-                            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string()
-                                + &String::from_utf8_lossy(&o.stderr),
-                            Err(e) => format!("Error: {}", e),
-                        };
-                        let _ = tx.send(result);
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn poll_ping(&mut self) {
-        if let Some(rx) = &self.ping_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.ping_running = false;
-                self.ping_rx = None;
-                self.ping_result = Some(result);
-            }
-        }
-    }
-
-    pub fn poll_service_restart(&mut self) {
-        if let Some(rx) = &self.service_restart_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.service_restart_rx = None;
-                self.service_restart_status = None;
-                self.services = get_services();
-                match result {
-                    Ok(_) => {
-                        self.message = Some(("Service(s) restarted successfully".to_string(), true));
+                    Ok(ActionOutcome::Text(t, body)) => {
+                        let lv = crate::ui::logview::LogViewer::new(&t, crate::ui::logview::Source::Static(body.lines().map(|s| s.to_string()).collect()));
+                        self.popups.push((Popup::Log(Box::new(lv)), origin));
                     }
                     Err(e) => {
-                        self.message = Some((e, false));
+                        self.popups.push((Popup::error(&title, &format!("{e:#}")), origin));
+                        self.refresh_origin(origin);
                     }
                 }
-                self.screen = Screen::RestartService;
-            }
-        }
-    }
-
-    pub fn poll_network_reset(&mut self) {
-        if let Some(rx) = &self.network_reset_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.network_reset_rx = None;
-                self.network_reset_status = None;
-                match result {
-                    Ok(NetworkResetTaskResult::Interfaces(ifaces)) => {
-                        self.network_ifaces = ifaces;
-                        self.network_index = 0;
-                        if self.network_ifaces.is_empty() {
-                            self.message = Some(("No physical interfaces found".to_string(), false));
-                            self.screen = Screen::Network;
-                        } else {
-                            self.screen = Screen::NetworkSelectIface;
-                        }
-                    }
-                    Ok(NetworkResetTaskResult::Applied) => {
-                        self.network_info = get_network_info();
-                        self.ping_target = self.network_info.gateway.clone();
-                        self.network_draft = NetworkInfo::default();
-                        self.network_ifaces.clear();
-                        self.network_index = 0;
-                        self.message = Some(("Network configured successfully".to_string(), true));
-                        self.screen = Screen::Network;
-                    }
-                    Err(e) => {
-                        self.message = Some((e, false));
-                        if matches!(self.screen, Screen::NetworkReset) {
-                            self.screen = Screen::Network;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_network_reset(&mut self, key: KeyCode) {
-        match &self.screen {
-            Screen::NetworkReset => {
-                if self.network_reset_rx.is_some() {
-                    return;
-                }
-
-                match key {
-                    KeyCode::Esc | KeyCode::Left => {
-                        self.screen = Screen::Network;
-                    }
-                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        let (tx, rx) = mpsc::channel();
-                        self.network_reset_rx = Some(rx);
-                        self.network_reset_status = Some("Detecting physical interfaces...".to_string());
-                        self.network_draft = NetworkInfo::default();
-
-                        thread::spawn(move || {
-                            let result = Ok(NetworkResetTaskResult::Interfaces(detect_physical_interfaces()));
-                            let _ = tx.send(result);
-                        });
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
-                        self.screen = Screen::Network;
-                    }
-                    _ => {}
-                }
-            }
-            Screen::NetworkSelectIface => {
-                match key {
-                    KeyCode::Esc | KeyCode::Left => {
-                        self.screen = Screen::Network;
-                    }
-                    KeyCode::Up => {
-                        if self.network_index > 0 {
-                            self.network_index -= 1;
-                        }
-                    }
-                    KeyCode::Down => {
-                        if self.network_index < self.network_ifaces.len().saturating_sub(1) {
-                            self.network_index += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(iface) = self.network_ifaces.get(self.network_index) {
-                            self.network_draft = NetworkInfo {
-                                ip: String::new(),
-                                netmask: "255.255.255.0".to_string(),
-                                gateway: self.network_info.gateway.clone(),
-                                iface: iface.name.clone(),
-                            };
-                        }
-                        self.password_field = 0; // reuse for field selection
-                        self.screen = Screen::NetworkConfigIP;
-                    }
-                    _ => {}
-                }
-            }
-            Screen::NetworkConfigIP => {
-                match key {
-                    KeyCode::Esc | KeyCode::Left => {
-                        self.screen = Screen::NetworkSelectIface;
-                    }
-                    KeyCode::Tab | KeyCode::Down => {
-                        self.password_field = (self.password_field + 1) % 3;
-                    }
-                    KeyCode::Up => {
-                        self.password_field = if self.password_field == 0 { 2 } else { self.password_field - 1 };
-                    }
-                    KeyCode::Char(c) => {
-                        if is_network_input_char(c) {
-                            match self.password_field {
-                                0 => self.network_draft.ip.push(c),
-                                1 => self.network_draft.netmask.push(c),
-                                2 => self.network_draft.gateway.push(c),
-                                _ => {}
-                            }
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        match self.password_field {
-                            0 => { self.network_draft.ip.pop(); }
-                            1 => { self.network_draft.netmask.pop(); }
-                            2 => { self.network_draft.gateway.pop(); }
-                            _ => {}
-                        }
-                    }
-                    KeyCode::Enter => {
-                        match validate_network_config(&self.network_draft) {
-                            Ok(_) => {
-                                self.screen = Screen::NetworkReview;
-                            }
-                            Err(e) => {
-                                self.message = Some((format!("Failed: {}", e), false));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Screen::NetworkReview => {
-                if self.network_reset_rx.is_some() {
-                    return;
-                }
-
-                match key {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('n') | KeyCode::Char('N') => {
-                        self.screen = Screen::NetworkConfigIP;
-                    }
-                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        match self.pending_network_config_preview() {
-                            Ok(_) => {
-                                let draft = self.network_draft.clone();
-                                let iface_name = draft.iface.clone();
-                                let (tx, rx) = mpsc::channel();
-                                self.network_reset_rx = Some(rx);
-                                self.network_reset_status =
-                                    Some("Applying network configuration...".to_string());
-
-                                thread::spawn(move || {
-                                    let result = apply_network_config(&iface_name, &draft)
-                                        .map(|_| NetworkResetTaskResult::Applied);
-                                    let _ = tx.send(result);
-                                });
-                            }
-                            Err(e) => {
-                                self.message = Some((format!("Failed: {}", e), false));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_service_confirm(&mut self, key: KeyCode, idx: usize) {
-        // Don't process keys while restarting
-        if self.service_restart_rx.is_some() {
-            return;
-        }
-
-        match key {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.screen = Screen::RestartService;
-            }
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // idx == services.len() means "Restart All"
-                let services_to_restart: Vec<String> = if idx >= self.services.len() {
-                    self.services.iter().map(|s| s.name.clone()).collect()
-                } else if let Some(service) = self.services.get(idx) {
-                    vec![service.name.clone()]
-                } else {
-                    return;
-                };
-
-                let (tx, rx) = mpsc::channel();
-                self.service_restart_rx = Some(rx);
-                self.service_restart_status = Some("Restarting...".to_string());
-
-                thread::spawn(move || {
-                    use std::process::Stdio;
-                    let mut failed = Vec::new();
-                    for name in &services_to_restart {
-                        let status = Command::new("systemctl")
-                            .args(["restart", name])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-                        if !status.map(|s| s.success()).unwrap_or(false) {
-                            failed.push(name.clone());
-                        }
-                    }
-                    if failed.is_empty() {
-                        let _ = tx.send(Ok(()));
-                    } else {
-                        let _ = tx.send(Err(format!("Failed: {}", failed.join(", "))));
-                    }
-                });
-            }
-            _ => {}
-        }
-    }
-}
-
-fn scrub_string(value: &mut String) {
-    let mut bytes = std::mem::take(value).into_bytes();
-    bytes.fill(0);
-}
-
-fn build_network_config(iface_name: &str, info: &NetworkInfo) -> String {
-    let cidr = netmask_to_cidr_num(&info.netmask);
-    format!(
-        r#"auto lo
-iface lo inet loopback
-
-auto {}
-iface {} inet manual
-
-auto vmbr0
-iface vmbr0 inet static
-    address {}/{}
-    gateway {}
-    bridge-ports {}
-    bridge-stp off
-    bridge-fd 0
-"#,
-        iface_name,
-        iface_name,
-        info.ip,
-        cidr,
-        info.gateway,
-        iface_name
-    )
-}
-
-fn backup_interfaces_dir(timestamp: &str) -> Result<Option<String>, String> {
-    use std::fs;
-
-    let interfaces_d = std::path::Path::new("/etc/network/interfaces.d");
-    if !interfaces_d.exists() {
-        return Ok(None);
-    }
-
-    let backup_dir = format!("/etc/network/interfaces.d.bak.{}", timestamp);
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("interfaces.d backup dir failed: {}", e))?;
-
-    for entry in fs::read_dir(interfaces_d).map_err(|e| format!("Read interfaces.d failed: {}", e))? {
-        let entry = entry.map_err(|e| format!("Read interfaces.d entry failed: {}", e))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Read interfaces.d entry type failed: {}", e))?;
-        if file_type.is_dir() {
-            return Err("interfaces.d contains a directory; refusing automatic reset".to_string());
-        }
-
-        let target = std::path::Path::new(&backup_dir).join(entry.file_name());
-        fs::copy(entry.path(), &target)
-            .map_err(|e| format!("interfaces.d backup copy failed: {}", e))?;
-    }
-
-    Ok(Some(backup_dir))
-}
-
-fn clear_interfaces_dir() -> Result<(), String> {
-    use std::fs;
-
-    let interfaces_d = std::path::Path::new("/etc/network/interfaces.d");
-    if !interfaces_d.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(interfaces_d).map_err(|e| format!("Read interfaces.d failed: {}", e))? {
-        let entry = entry.map_err(|e| format!("Read interfaces.d entry failed: {}", e))?;
-        let path = entry.path();
-        if path.is_dir() {
-            return Err("interfaces.d contains a directory; refusing automatic reset".to_string());
-        }
-        fs::remove_file(&path).map_err(|e| format!("Clear interfaces.d failed: {}", e))?;
-    }
-
-    Ok(())
-}
-
-fn restore_interfaces_dir(backup_dir: Option<&str>) -> Result<(), String> {
-    use std::fs;
-
-    let interfaces_d = std::path::Path::new("/etc/network/interfaces.d");
-    fs::create_dir_all(interfaces_d)
-        .map_err(|e| format!("Recreate interfaces.d failed: {}", e))?;
-    clear_interfaces_dir()?;
-
-    if let Some(backup_dir) = backup_dir {
-        for entry in fs::read_dir(backup_dir).map_err(|e| format!("Read interfaces.d backup failed: {}", e))? {
-            let entry = entry.map_err(|e| format!("Read interfaces.d backup entry failed: {}", e))?;
-            let target = interfaces_d.join(entry.file_name());
-            fs::copy(entry.path(), target)
-                .map_err(|e| format!("Restore interfaces.d failed: {}", e))?;
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_network_config(iface_name: &str, info: &NetworkInfo) -> Result<(), String> {
-    use chrono::Local;
-    use std::fs;
-
-    validate_network_config(info)?;
-
-    let config = build_network_config(iface_name, info);
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let backup_path = format!("/etc/network/interfaces.bak.{}", timestamp);
-
-    fs::copy("/etc/network/interfaces", &backup_path)
-        .map_err(|e| format!("Backup failed: {}", e))?;
-    let interfaces_d_backup = backup_interfaces_dir(&timestamp)?;
-
-    let apply_result = (|| -> Result<(), String> {
-        fs::write("/etc/network/interfaces", &config)
-            .map_err(|e| format!("Write failed: {}", e))?;
-        clear_interfaces_dir()?;
-
-        let status = Command::new("ifreload")
-            .arg("-a")
-            .status()
-            .map_err(|e| format!("ifreload failed: {}", e))?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err("ifreload returned error".to_string())
-        }
-    })();
-
-    if apply_result.is_ok() {
-        return Ok(());
-    }
-
-    let apply_error = apply_result.err().unwrap_or_else(|| "Unknown error".to_string());
-    let rollback_interfaces =
-        fs::copy(&backup_path, "/etc/network/interfaces").map_err(|e| format!("Rollback failed: {}", e));
-    let rollback_dir = restore_interfaces_dir(interfaces_d_backup.as_deref());
-
-    if rollback_interfaces.is_ok() && rollback_dir.is_ok() {
-        let _ = Command::new("ifreload").arg("-a").status();
-        Err(format!(
-            "{}; configuration was rolled back",
-            apply_error
-        ))
-    } else {
-        let mut details = vec![apply_error];
-        if let Err(e) = rollback_interfaces {
-            details.push(e);
-        }
-        if let Err(e) = rollback_dir {
-            details.push(e);
-        }
-        Err(details.join("; "))
-    }
-}
-
-fn get_services() -> Vec<Service> {
-    let service_names = [
-        ("pve-cluster", "PVE Cluster"),
-        ("pvedaemon", "PVE Daemon"),
-        ("pveproxy", "PVE Proxy (Web UI)"),
-        ("pvestatd", "PVE Status Daemon"),
-        ("ssh", "SSH Server"),
-    ];
-
-    service_names
-        .iter()
-        .map(|(name, display)| {
-            let running = Command::new("systemctl")
-                .args(["is-active", "--quiet", name])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            Service {
-                name: name.to_string(),
-                display: display.to_string(),
-                running,
-            }
-        })
-        .collect()
-}
-
-fn get_pve_version() -> String {
-    Command::new("dpkg-query")
-        .args(["-W", "-f=${Version}", "pve-manager"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
             } else {
-                None
+                i += 1;
             }
-        })
-        .unwrap_or_else(|| "Unknown".to_string())
-}
+        }
 
-fn get_hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
+        // current view polling + auto refresh
+        let (m, v) = (self.cur, self.modules[self.cur].sel);
+        {
+            let view = &mut self.modules[m].views[v];
+            view.poll(&mut self.ctx);
+            if self.auto_refresh {
+                if let Some(secs) = view.refresh_secs() {
+                    let due = self.last_refresh.get(&(m, v)).map(|t| t.elapsed() >= Duration::from_secs(secs.max(self.ctx.cfg.refresh_secs))).unwrap_or(true);
+                    if due {
+                        view.refresh(&mut self.ctx);
+                        self.last_refresh.insert((m, v), Instant::now());
+                    }
+                }
+            }
+        }
+        self.process_cmds(Origin::View(m, v));
 
-fn get_kernel_version() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
+        // ticket renewal
+        if self.last_renew_check.elapsed() > Duration::from_secs(300) && self.renew.is_none() {
+            self.last_renew_check = Instant::now();
+            if self.ctx.api.needs_renew() {
+                let api = self.ctx.api.clone();
+                let forge = match &self.ssh {
+                    Some(t) => Some(crate::exec::Exec::Ssh(t.target.clone())),
+                    None if crate::util::is_root_process() && self.remote.is_none() => Some(crate::exec::Exec::Local),
+                    None => None,
+                };
+                self.renew = Some(Job::spawn(move || {
+                    if api.renew().is_err() && api.auth().map(|a| a.user == "root@pam").unwrap_or(false) {
+                        if let Some(e) = forge {
+                            api.set_auth(api::forge_root_auth_with(&e)?);
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+        }
+        if let Some(j) = &self.renew {
+            if let Some(r) = j.poll() {
+                self.renew = None;
+                if let Err(e) = r {
+                    self.toast(format!("ticket renewal failed: {e:#}"), true);
+                }
+            }
+        }
 
-fn get_network_info() -> NetworkInfo {
-    let mut info = NetworkInfo::default();
+        // rescue: switch back to the HTTP API once pveproxy is reachable again
+        if self.ctx.session.rescue && self.recover.is_none() && self.last_recover.elapsed() > Duration::from_secs(15) {
+            self.last_recover = Instant::now();
+            self.recover = Some(Job::spawn(|| {
+                let api = Api::local();
+                api.domains()?;
+                api.set_auth(api::forge_root_auth()?);
+                api.get("/version")?;
+                Ok(Arc::new(api))
+            }));
+        }
+        if let Some(j) = &self.recover {
+            if let Some(r) = j.poll() {
+                self.recover = None;
+                if let Ok(api) = r {
+                    self.ctx.api = api;
+                    self.ctx.session.rescue = false;
+                    self.toast("PVE API is reachable again: left rescue mode".into(), false);
+                    self.start_metrics();
+                }
+            }
+        }
 
-    // Get default gateway and interface
-    if let Ok(output) = Command::new("ip").args(["route", "show", "default"]).output() {
-        let line = String::from_utf8_lossy(&output.stdout);
-        // default via 192.168.1.1 dev vmbr0
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 5 {
-            info.gateway = parts.get(2).unwrap_or(&"").to_string();
-            info.iface = parts.get(4).unwrap_or(&"").to_string();
+        if let Some(j) = &self.arch_job {
+            if let Some(r) = j.poll() {
+                self.arch_job = None;
+                if let Ok((n, a)) = r {
+                    if !a.is_empty() {
+                        self.ctx.node_arch.insert(n, a);
+                    }
+                }
+            }
+        }
+
+        // alerts
+        self.alerts.poll();
+        if self.alerts.stale(Duration::from_secs(30)) {
+            let api = self.ctx.api.clone();
+            let node = self.ctx.node.clone();
+            let exec = self.ctx.exec();
+            self.alerts.load(move || Ok(collect_alerts(&api, &node, exec)));
+        }
+
+        if let Some((_, _, t)) = &self.toast {
+            if t.elapsed() > Duration::from_secs(6) {
+                self.toast = None;
+            }
         }
     }
 
-    // Get IP address of the interface
-    if !info.iface.is_empty() {
-        if let Ok(output) = Command::new("ip")
-            .args(["-o", "-4", "addr", "show", &info.iface])
-            .output()
-        {
-            let line = String::from_utf8_lossy(&output.stdout);
-            // 2: vmbr0 inet 192.168.1.100/24 brd ...
-            for part in line.split_whitespace() {
-                if part.contains('/') && part.contains('.') {
-                    if let Some((ip, mask)) = part.split_once('/') {
-                        info.ip = ip.to_string();
-                        // Convert CIDR to netmask
-                        info.netmask = cidr_to_netmask(mask.parse().unwrap_or(24));
+    fn refresh_origin(&mut self, origin: Origin) {
+        if let Origin::View(m, v) = origin {
+            if m < self.modules.len() && v < self.modules[m].views.len() {
+                self.modules[m].views[v].refresh(&mut self.ctx);
+                self.last_refresh.insert((m, v), Instant::now());
+                self.process_cmds(origin);
+            }
+        }
+    }
+
+    fn refresh_current(&mut self, force: bool) {
+        let (m, v) = (self.cur, self.modules[self.cur].sel);
+        let stale = self.last_refresh.get(&(m, v)).map(|t| t.elapsed() > Duration::from_secs(2)).unwrap_or(true);
+        if force || stale {
+            self.modules[m].views[v].refresh(&mut self.ctx);
+            self.last_refresh.insert((m, v), Instant::now());
+            self.process_cmds(Origin::View(m, v));
+        }
+    }
+
+    fn process_cmds(&mut self, origin: Origin) {
+        let cmds = std::mem::take(&mut self.ctx.cmds);
+        for c in cmds {
+            match c {
+                Cmd::Popup(p) => self.popups.push((p, origin)),
+                Cmd::Toast(m, e) => self.toast(m, e),
+                Cmd::Action { title, job } => {
+                    crate::audit(&self.ctx.session.user, &self.ctx.node, &title);
+                    self.toast(format!("{title}..."), false);
+                    self.actions.push((title, job, origin));
+                }
+                Cmd::Suspend(s) => self.pending_suspend = Some(s),
+                Cmd::Vnc(r) => self.pending_vnc = Some(r),
+                Cmd::SwitchNode(n) => self.switch_node(n),
+            }
+        }
+    }
+
+    fn goto(&mut self, m: usize, v: usize) {
+        if m < self.modules.len() {
+            self.cur = m;
+            if v < self.modules[m].views.len() {
+                self.modules[m].sel = v;
+            }
+            self.focus = Focus::List;
+            self.narrow_detail = false;
+            self.refresh_current(false);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // keys
+    // -----------------------------------------------------------------------
+
+    pub fn on_key(&mut self, key: KeyEvent) {
+        self.note_activity();
+        // quitting: only Ctrl+Q (outside tty1 / serial console), always confirmed
+        if self.confirm_quit {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.should_exit = true,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.confirm_quit = false,
+                _ => {}
+            }
+            return;
+        }
+        if self.can_quit && key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+            self.confirm_quit = true;
+            return;
+        }
+        match self.screen {
+            Screen::Dashboard => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::F(2) | KeyCode::Char(' ') => self.screen = Screen::Login,
+                    _ => {}
+                }
+                return;
+            }
+            Screen::Login => {
+                match self.login.handle_key(&key) {
+                    Some(LoginEvent::Back) => {
+                        if self.remote.is_none() && self.ssh.is_none() && self.ctx.cfg.prelogin_dashboard {
+                            self.screen = Screen::Dashboard;
+                        }
                     }
-                    break;
+                    Some(LoginEvent::Trusted(fp)) => {
+                        if let Some(r) = &self.remote {
+                            if let Err(e) = api::save_fingerprint(&r.host, &fp) {
+                                self.login.message = Some((format!("could not save fingerprint: {e}"), true));
+                            }
+                            let api = Arc::new(Api::http(&r.host, r.port, Some(fp)));
+                            self.ctx.api = api.clone();
+                            self.login.set_api(api);
+                        }
+                    }
+                    None => {}
+                }
+                return;
+            }
+            Screen::Main => {}
+        }
+
+        // popups first
+        if let Some((popup, origin)) = self.popups.last_mut() {
+            let origin = *origin;
+            let out = popup.handle_key(&key);
+            match out {
+                Outcome::None => {}
+                Outcome::Close => {
+                    if let Some((p, o)) = self.popups.pop() {
+                        if let Popup::Task(t) = p {
+                            if !t.done {
+                                self.bg_tasks.push((*t, o));
+                            } else {
+                                self.refresh_origin(o);
+                            }
+                        }
+                    }
+                }
+                Outcome::Menu(tag, k) => {
+                    self.popups.pop();
+                    match origin {
+                        Origin::Global => self.global_action(&tag, k),
+                        Origin::View(m, v) => {
+                            self.modules[m].views[v].on_menu(&tag, k, &mut self.ctx);
+                            self.process_cmds(origin);
+                        }
+                    }
+                }
+                Outcome::Confirmed(tag) => {
+                    self.popups.pop();
+                    match origin {
+                        Origin::Global => self.global_confirm(&tag),
+                        Origin::View(m, v) => {
+                            self.modules[m].views[v].on_confirm(&tag, &mut self.ctx);
+                            self.process_cmds(origin);
+                        }
+                    }
+                }
+                Outcome::Form(tag, values) => {
+                    self.popups.pop();
+                    if let Origin::View(m, v) = origin {
+                        self.modules[m].views[v].on_form(&tag, &values, &mut self.ctx);
+                        self.process_cmds(origin);
+                    }
+                }
+            }
+            return;
+        }
+
+        let (m, v) = (self.cur, self.modules[self.cur].sel);
+        let origin = Origin::View(m, v);
+
+        // filter input line
+        if self.filter_edit {
+            if let Some(t) = self.modules[m].views[v].table() {
+                match key.code {
+                    KeyCode::Esc => {
+                        t.filter.clear();
+                        self.filter_edit = false;
+                    }
+                    KeyCode::Enter | KeyCode::Down | KeyCode::Up => self.filter_edit = false,
+                    KeyCode::Backspace => {
+                        t.filter.pop();
+                    }
+                    KeyCode::Char(c) => t.filter.push(c),
+                    _ => {}
+                }
+            } else {
+                self.filter_edit = false;
+            }
+            return;
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        // global keys
+        match key.code {
+            KeyCode::F(n @ 1..=5) => {
+                let i = n as usize - 1;
+                return self.goto(i, self.modules[i].sel);
+            }
+            KeyCode::F(6) => return self.open_node_picker(),
+            KeyCode::F(8) => return self.goto_title("Tasks"),
+            KeyCode::F(10) => return self.open_shell(),
+            KeyCode::Char('r') if ctrl => return self.refresh_current(true),
+            KeyCode::Tab => return self.goto((self.cur + 1) % self.modules.len(), self.modules[(self.cur + 1) % self.modules.len()].sel),
+            KeyCode::BackTab => {
+                let n = (self.cur + self.modules.len() - 1) % self.modules.len();
+                return self.goto(n, self.modules[n].sel);
+            }
+            KeyCode::Char(c @ '1'..='9') if !ctrl && !alt => {
+                let i = c as usize - '1' as usize;
+                if i < self.modules[m].views.len() {
+                    return self.goto(m, i);
+                }
+                return;
+            }
+            KeyCode::Char('[') => {
+                let n = self.modules[m].views.len();
+                return self.goto(m, (v + n - 1) % n);
+            }
+            KeyCode::Char(']') => {
+                let n = self.modules[m].views.len();
+                return self.goto(m, (v + 1) % n);
+            }
+            KeyCode::Char('/') => {
+                if self.modules[m].views[v].table().is_some() {
+                    self.filter_edit = true;
+                    self.focus = Focus::List;
+                }
+                return;
+            }
+            KeyCode::Char('g') if !ctrl => return self.open_global_menu(),
+            KeyCode::Char('g') if ctrl => return self.open_global_menu(),
+            KeyCode::Char('?') => return self.open_help(),
+            KeyCode::Char('q') => {
+                if self.ssh.is_some() {
+                    // SSH mode: logging out disconnects, so ask first
+                    self.confirm_quit = true;
+                } else {
+                    self.logout();
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                if self.narrow_detail || self.focus == Focus::Detail {
+                    self.narrow_detail = false;
+                    self.focus = Focus::List;
+                } else if let Some(t) = self.modules[m].views[v].table() {
+                    if !t.filter.is_empty() {
+                        t.filter.clear();
+                    } else if !t.marked.is_empty() {
+                        t.marked.clear();
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        match self.focus {
+            Focus::Detail => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => return self.modules[m].views[v].scroll_detail(-1),
+                KeyCode::Down | KeyCode::Char('j') => return self.modules[m].views[v].scroll_detail(1),
+                KeyCode::PageUp => return self.modules[m].views[v].scroll_detail(-10),
+                KeyCode::PageDown => return self.modules[m].views[v].scroll_detail(10),
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.focus = Focus::List;
+                    self.narrow_detail = false;
+                    return;
+                }
+                _ => {}
+            },
+            Focus::List => {}
+        }
+
+        // view specific keys
+        if self.modules[m].views[v].on_key(&key, &mut self.ctx) {
+            self.process_cmds(origin);
+            return;
+        }
+
+        if key.code == KeyCode::Enter || key.code == KeyCode::Char('m') {
+            return self.open_context_menu();
+        }
+
+        // menu hotkeys
+        if let KeyCode::Char(c) = key.code {
+            if !ctrl && !matches!(c, 'h' | 'j' | 'k' | 'l' | 'r' | 'a' | ' ' | 'G') {
+                let items = self.view_menu(m, v);
+                if let Some(it) = items.iter().find(|i| i.key == c) {
+                    if let Some(reason) = &it.disabled {
+                        self.toast(format!("{}: {reason}", tr(&it.label)), true);
+                    } else {
+                        self.modules[m].views[v].on_menu("ctx", c, &mut self.ctx);
+                        self.process_cmds(origin);
+                    }
+                    return;
+                }
+            }
+        }
+
+        if self.focus == Focus::List {
+            if let Some(t) = self.modules[m].views[v].table() {
+                if t.handle_key(&key) {
+                    return;
+                }
+            }
+        }
+
+        match key.code {
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.modules[m].views[v].has_detail() {
+                    self.focus = Focus::Detail;
+                    if self.width < 110 {
+                        self.narrow_detail = true;
+                    }
+                }
+            }
+            KeyCode::Char('r') => self.refresh_current(true),
+            KeyCode::Char('a') => {
+                self.auto_refresh = !self.auto_refresh;
+                self.toast(format!("auto-refresh {}", if self.auto_refresh { "on" } else { "off" }), false);
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                // views without a table scroll their main pane
+                let d = match key.code {
+                    KeyCode::Up => -1,
+                    KeyCode::Down => 1,
+                    KeyCode::PageUp => -10,
+                    _ => 10,
+                };
+                self.modules[m].views[v].scroll_detail(d);
+            }
+            _ => {}
+        }
+    }
+
+    /// A view's menu; in API-only remote mode actions that need host commands are hidden.
+    fn view_menu(&self, m: usize, v: usize) -> Vec<MenuItem> {
+        let mut items = self.modules[m].views[v].menu(&self.ctx);
+        if self.ctx.remote {
+            items.retain(|i| i.disabled.as_deref() != Some(crate::ctx::NEEDS_SSH));
+        }
+        items
+    }
+
+    fn goto_title(&mut self, title: &str) {
+        for (m, module) in self.modules.iter().enumerate() {
+            if let Some(v) = module.views.iter().position(|x| x.title() == title) {
+                return self.goto(m, v);
+            }
+        }
+    }
+
+    fn open_context_menu(&mut self) {
+        let (m, v) = (self.cur, self.modules[self.cur].sel);
+        let items = self.view_menu(m, v);
+        if items.is_empty() {
+            return;
+        }
+        let title = self.modules[m].views[v].menu_title();
+        self.popups.push((Popup::menu(&title, "ctx", items), Origin::View(m, v)));
+    }
+
+    fn open_global_menu(&mut self) {
+        let root = self.ctx.need_root();
+        let items: Vec<MenuItem> = vec![
+            item('n', "Switch node (F6)").disabled_if(self.ctx.nodes.len() < 2, "single node"),
+            item('r', "Refresh all"),
+            item('a', "Toggle auto-refresh"),
+            item('t', "Task center (F8)"),
+            item('A', "Alerts"),
+            item('L', "Language").disabled_if(!i18n::cjk_capable(), "tty: English only"),
+            item('s', "Enter shell").require(root.clone()).disabled_if(self.ctx.exec().is_none(), tr("local only")),
+            item('?', "Help"),
+            item('i', "About"),
+            item('o', "Log out"),
+            item('Q', "Quit").disabled_if(!self.can_quit, "system console"),
+        ];
+        self.popups.push((Popup::menu("Global Menu", "global", items), Origin::Global));
+    }
+
+    fn open_node_picker(&mut self) {
+        if self.ctx.nodes.is_empty() {
+            return;
+        }
+        let keys: Vec<char> = "123456789abcdefhijklmnopqrstuvwxyz".chars().collect();
+        let items: Vec<MenuItem> = self
+            .ctx
+            .nodes
+            .iter()
+            .enumerate()
+            .take(keys.len())
+            .map(|(i, n)| {
+                let mut label = format!("{:<16} {:<16} {}", n.name, n.ip, if n.online { "online" } else { "OFFLINE" });
+                if n.local {
+                    label.push_str("  (local)");
+                }
+                if n.name == self.ctx.node {
+                    label.push_str("  *");
+                }
+                MenuItem { key: keys[i], label, disabled: if n.online { None } else { Some("offline".into()) } }
+            })
+            .collect();
+        self.popups.push((Popup::menu("Switch node", "node", items), Origin::Global));
+    }
+
+    fn open_help(&mut self) {
+        let zh = i18n::is_zh();
+        let text = if zh { HELP_ZH } else { HELP_EN };
+        self.popups.push((Popup::text("Help", text), Origin::Global));
+    }
+
+    fn open_shell(&mut self) {
+        if let Err(e) = self.ctx.need_root() {
+            self.toast(format!("{}: {e}", tr("Enter shell")), true);
+            return;
+        }
+        let Some(exec) = self.ctx.exec() else {
+            self.toast(format!("{}: {}", tr("Enter shell"), tr("local only")), true);
+            return;
+        };
+        let (prog, args) = match exec {
+            crate::exec::Exec::Local => ("/bin/bash".to_string(), vec!["-i".to_string(), "-l".to_string()]),
+            _ => ("/bin/bash".to_string(), vec!["-l".to_string()]),
+        };
+        self.pending_suspend = Some(Suspend {
+            banner: format!(
+                "Entering shell on {} ({}). Type 'exit' to return to the console.\nShell will auto-logout after {} minutes of inactivity.\n",
+                self.ctx.node,
+                exec.label(),
+                self.ctx.cfg.idle_timeout_secs / 60
+            ),
+            exec,
+            prog,
+            args,
+            env: vec![("TMOUT".into(), self.ctx.cfg.idle_timeout_secs.to_string())],
+            logout_after: self.ssh.is_none(),
+            pause_after: false,
+        });
+        crate::audit(&self.ctx.session.user, &self.ctx.node, "enter shell");
+    }
+
+    fn global_action(&mut self, tag: &str, k: char) {
+        if tag == "node" {
+            let keys: Vec<char> = "123456789abcdefhijklmnopqrstuvwxyz".chars().collect();
+            if let Some(i) = keys.iter().position(|c| *c == k) {
+                if let Some(n) = self.ctx.nodes.get(i) {
+                    let name = n.name.clone();
+                    self.switch_node(name);
+                }
+            }
+            return;
+        }
+        match k {
+            'n' => self.open_node_picker(),
+            'r' => {
+                self.last_refresh.clear();
+                let api = self.ctx.api.clone();
+                let (nodes, cluster) = login::load_nodes(&api);
+                if !nodes.is_empty() {
+                    self.ctx.nodes = nodes;
+                    self.cluster = cluster;
+                }
+                self.refresh_current(true);
+            }
+            'a' => {
+                self.auto_refresh = !self.auto_refresh;
+                self.toast(format!("auto-refresh {}", if self.auto_refresh { "on" } else { "off" }), false);
+            }
+            't' => self.goto_title("Tasks"),
+            'A' => {
+                let text = match &self.alerts.data {
+                    Some(a) if !a.is_empty() => a.join("\n"),
+                    _ => tr("No alerts").to_string(),
+                };
+                self.popups.push((Popup::text("Alerts", &text), Origin::Global));
+            }
+            'L' => {
+                if !i18n::toggle() {
+                    self.toast("this terminal cannot display Chinese".into(), true);
+                }
+            }
+            's' => self.open_shell(),
+            '?' => self.open_help(),
+            'i' => {
+                let text = format!(
+                    "pxvirt-console {APP_VERSION}\n\nPXVIRT Direct Console User Interface\nhttps://github.com/jiangcuo/pxvirt-console\n\nAPI: {}{}\nUser: {}\nNode: {}\nCluster: {}",
+                    self.ctx.api.base_url(),
+                    if self.ctx.api.is_pvesh() { " (pvesh)" } else { "" },
+                    self.ctx.session.user,
+                    self.ctx.node,
+                    if self.cluster.is_empty() { "-" } else { &self.cluster }
+                );
+                self.popups.push((Popup::text("About", &text), Origin::Global));
+            }
+            'o' => self.logout(),
+            'Q' => self.confirm_quit = true,
+            _ => {}
+        }
+    }
+
+    fn global_confirm(&mut self, tag: &str) {
+        if tag == "quit" {
+            self.should_exit = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // drawing
+    // -----------------------------------------------------------------------
+
+    pub fn draw(&mut self, f: &mut Frame) {
+        self.draw_screen(f);
+        if self.confirm_quit {
+            let area = f.area();
+            let r = ui::centered(44, 6, area);
+            ui::clear(f, r);
+            let lines = vec![
+                Line::from(Span::styled(tr("Quit pxvirt-console?").to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" Y ", Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" {}     ", tr("Quit"))),
+                    Span::styled(" N ", Style::default().bg(Color::Gray).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" {}", tr("Cancel"))),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines).block(ui::popup_block("Quit")), r);
+        }
+    }
+
+    fn draw_screen(&mut self, f: &mut Frame) {
+        let area = f.area();
+        self.width = area.width;
+        let mdata = self.metrics.snapshot();
+        ui::clear(f, area);
+        match self.screen {
+            Screen::Dashboard | Screen::Login => {
+                let rows = vsplit(area, &[Constraint::Length(1), Constraint::Min(5), Constraint::Length(1), Constraint::Length(1)]);
+                self.draw_header(f, rows[0]);
+                if self.remote.is_none() && self.screen == Screen::Dashboard {
+                    login::draw_dashboard(f, rows[1], &self.host, &mdata);
+                }
+                if self.screen == Screen::Login {
+                    self.login.draw(f, rows[1], &self.host_label());
+                }
+                if mdata.ok {
+                    draw_status(f, rows[2], &mdata, None);
+                }
+                let mut hints = if self.screen == Screen::Dashboard { vec![("Enter", "Log in")] } else { vec![("Enter", "Log in"), ("Tab", "next field"), ("Esc", "back")] };
+                if self.can_quit {
+                    hints.push(("Ctrl+Q", "Quit"));
+                }
+                f.render_widget(Paragraph::new(Line::from(hint_spans(&hints))).style(Style::default().bg(ui::BAR).fg(Color::White)), rows[3]);
+                return;
+            }
+            Screen::Main => {}
+        }
+
+        let full = self.popups.last().map(|(p, _)| p.fullscreen()).unwrap_or(false);
+        if full {
+            if let Some((p, _)) = self.popups.last_mut() {
+                p.draw(f, area);
+            }
+            return;
+        }
+
+        // action bar: every action of the current page, always visible
+        let (cm, cv) = (self.cur, self.modules[self.cur].sel);
+        let action_lines = action_bar_lines(&self.view_menu(cm, cv), area.width);
+        let mut cons = vec![Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Min(3)];
+        if self.filter_edit {
+            cons.push(Constraint::Length(1));
+        }
+        if !action_lines.is_empty() {
+            cons.push(Constraint::Length(action_lines.len() as u16));
+        }
+        cons.extend([Constraint::Length(1), Constraint::Length(1)]);
+        let rows = vsplit(area, &cons);
+        let mut i = 0;
+        self.draw_header(f, rows[i]);
+        i += 1;
+        self.draw_tabs(f, rows[i]);
+        i += 1;
+        self.draw_subtabs(f, rows[i]);
+        i += 1;
+        let body = rows[i];
+        i += 1;
+        self.draw_body(f, body);
+        if self.filter_edit {
+            let (m, v) = (self.cur, self.modules[self.cur].sel);
+            let filter = self.modules[m].views[v].table().map(|t| t.filter.clone()).unwrap_or_default();
+            f.render_widget(
+                Paragraph::new(Line::from(vec![Span::styled(format!(" {}", tr("Filter: ")), Style::default().fg(ACCENT)), Span::raw(format!("{filter}_"))])),
+                rows[i],
+            );
+            i += 1;
+        }
+        if !action_lines.is_empty() {
+            f.render_widget(Paragraph::new(action_lines).style(ui::base()), rows[i]);
+            i += 1;
+        }
+        let alerts = self.alerts.data.as_ref().map(|a| a.len());
+        draw_status(f, rows[i], &mdata, Some((alerts, self.bg_tasks.len() + self.actions.len())));
+        i += 1;
+        self.draw_hints(f, rows[i]);
+
+        for (p, _) in self.popups.iter_mut() {
+            p.draw(f, body);
+        }
+    }
+
+    fn draw_header(&self, f: &mut Frame, area: Rect) {
+        let bar = Style::default().bg(ui::BAR).fg(Color::White);
+        f.render_widget(Paragraph::new("").style(bar), area);
+        let mut left = vec![Span::styled(" PXVIRT ", bar.add_modifier(Modifier::BOLD)), Span::styled(format!("│ {}", self.host_label()), bar)];
+        if self.screen == Screen::Main && !self.cluster.is_empty() {
+            left.push(Span::styled(format!(" · {}", self.cluster), bar));
+        }
+        let mut right: Vec<Span> = Vec::new();
+        if self.screen == Screen::Main {
+            if self.ctx.session.rescue {
+                right.push(Span::styled(" RESCUE ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+                right.push(Span::styled(" ", bar));
+            }
+            if let Some(t) = &self.ssh {
+                right.push(Span::styled(format!(" SSH {} ", t.label), Style::default().bg(Color::Magenta).fg(Color::White)));
+                right.push(Span::styled(" ", bar));
+            }
+            if let Some(r) = &self.remote {
+                right.push(Span::styled(format!(" remote {} ", r.host), Style::default().bg(Color::Magenta).fg(Color::White)));
+                right.push(Span::styled(" ", bar));
+            }
+            if !self.auto_refresh {
+                right.push(Span::styled(" manual ", Style::default().bg(Color::Yellow).fg(Color::Black)));
+                right.push(Span::styled(" ", bar));
+            }
+            right.push(Span::styled(format!("{}  ", self.ctx.session.user), bar));
+            let arch = self.ctx.node_arch.get(&self.ctx.node).map(|a| format!(" {a}")).unwrap_or_default();
+            right.push(Span::styled(format!(" {}{arch} ", self.ctx.node), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)));
+        }
+        right.push(Span::styled(format!("  {} ", chrono::Local::now().format("%H:%M")), bar));
+        let rw: usize = right.iter().map(|s| s.width()).sum();
+        let parts = hsplit(area, &[Constraint::Min(10), Constraint::Length(rw as u16)]);
+        f.render_widget(Paragraph::new(Line::from(left)).style(bar), parts[0]);
+        f.render_widget(Paragraph::new(Line::from(right)).style(bar), parts[1]);
+    }
+
+    /// Module tabs: F1..F5, the current one as a cyan block.
+    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
+        let mut spans = vec![Span::raw(" ")];
+        for (i, m) in self.modules.iter().enumerate() {
+            let label = format!(" F{} {} ", i + 1, tr(m.title));
+            if i == self.cur {
+                spans.push(Span::styled(label, Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)));
+            } else {
+                spans.push(Span::styled(label, Style::default().bg(ui::BAR).fg(Color::White)));
+            }
+            spans.push(Span::raw(" "));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(ui::base()), area);
+    }
+
+    /// Submenu: 1..9, the current one as a white block.
+    fn draw_subtabs(&self, f: &mut Frame, area: Rect) {
+        let m = &self.modules[self.cur];
+        let mut spans = vec![Span::raw(" ")];
+        for (i, v) in m.views.iter().enumerate() {
+            let label = format!(" {} {} ", i + 1, tr(v.title()));
+            if i == m.sel {
+                spans.push(Span::styled(label, Style::default().bg(Color::Gray).fg(Color::Black).add_modifier(Modifier::BOLD)));
+            } else {
+                spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
+            }
+            spans.push(Span::raw(" "));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(ui::base()), area);
+    }
+
+    fn draw_body(&mut self, f: &mut Frame, area: Rect) {
+        let (m, v) = (self.cur, self.modules[self.cur].sel);
+        let focus = self.focus;
+        let width = area.width;
+        let split = |a: Rect, c: &[Constraint]| Layout::default().direction(Direction::Horizontal).constraints(c.to_vec()).spacing(2).split(a).to_vec();
+        let view = &mut self.modules[m].views[v];
+        if !view.has_detail() {
+            view.draw_list(f, area, &self.ctx, true);
+            return;
+        }
+        if width < 110 {
+            if self.narrow_detail {
+                view.draw_detail(f, area, &self.ctx, true);
+            } else {
+                view.draw_list(f, area, &self.ctx, true);
+            }
+            return;
+        }
+        if width >= 200 {
+            let parts = split(area, &[Constraint::Percentage(48), Constraint::Percentage(30), Constraint::Percentage(22)]);
+            view.draw_list(f, parts[0], &self.ctx, focus == Focus::List);
+            view.draw_detail(f, parts[1], &self.ctx, focus == Focus::Detail);
+            if !view.draw_extra(f, parts[2], &self.ctx) {
+                draw_metrics_panel(f, parts[2], &self.metrics.snapshot());
+            }
+            return;
+        }
+        let parts = split(area, &[Constraint::Percentage(58), Constraint::Percentage(42)]);
+        view.draw_list(f, parts[0], &self.ctx, focus == Focus::List);
+        view.draw_detail(f, parts[1], &self.ctx, focus == Focus::Detail);
+    }
+
+    fn draw_hints(&mut self, f: &mut Frame, area: Rect) {
+        if let Some((msg, err, _)) = &self.toast {
+            let st = if *err { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) };
+            crate::ui::clear(f, area);
+            f.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ● ", st), Span::styled(msg.clone(), st)])).style(ui::base()), area);
+            return;
+        }
+        let (m, v) = (self.cur, self.modules[self.cur].sel);
+        // owned (key, label) pairs; the page's own actions come first so they are discoverable
+        let mut hints: Vec<(String, String)> = Vec::new();
+        if !self.popups.is_empty() {
+            hints.extend([("Esc".into(), "close".into()), ("Enter".into(), "select".into())]);
+        } else {
+            let view = &self.modules[m].views[v];
+            hints.extend(view.hints().into_iter().map(|(k, l)| (k.to_string(), l.to_string())));
+            hints.push(("Enter".into(), "menu".into()));
+            if view.has_detail() && self.width < 110 {
+                hints.push(("→".into(), "details".into()));
+            }
+            hints.extend([("/".into(), "filter".into()), ("F6".into(), "node".into()), ("?".into(), "help".into()), ("q".into(), if self.ssh.is_some() { "disconnect".into() } else { "logout".into() })]);
+            if self.can_quit {
+                hints.push(("Ctrl+Q".into(), "Quit".into()));
+            }
+        }
+        let refs: Vec<(&str, &str)> = hints.iter().map(|(k, l)| (k.as_str(), l.as_str())).collect();
+        f.render_widget(Paragraph::new(Line::from(hint_spans(&refs))).style(Style::default().bg(ui::BAR).fg(Color::White)), area);
+    }
+}
+
+/// Action bar label: drop the parenthesised detail ("Kill (SIGKILL)" -> "Kill").
+fn short_label(l: &str) -> String {
+    let cut = l.find(" (").or_else(|| l.find('（')).or_else(|| l.find('(')).unwrap_or(l.len());
+    l[..cut].trim().to_string()
+}
+
+/// The page's actions as "[key] label" chips, wrapped onto at most 3 lines.
+/// Disabled actions stay visible (dimmed) so users learn what exists.
+fn action_bar_lines(items: &[MenuItem], width: u16) -> Vec<Line<'static>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let max_w = width.saturating_sub(1) as usize;
+    let mut lines: Vec<Vec<Span<'static>>> = vec![vec![Span::styled(format!(" {} ", tr("Actions")), Style::default().fg(Color::Gray))]];
+    let mut cur_w = lines[0][0].width();
+    let indent = cur_w;
+    for it in items {
+        let enabled = it.disabled.is_none();
+        let key_st = if enabled { Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD) } else { Style::default().bg(Color::Black).fg(Color::DarkGray) };
+        let lab_st = if enabled { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray) };
+        let key = Span::styled(format!(" {} ", it.key), key_st);
+        let label = Span::styled(format!(" {}  ", short_label(tr(&it.label))), lab_st);
+        let w = key.width() + label.width();
+        let reserve = if lines.len() == 3 { 10 } else { 0 };
+        if cur_w + w + reserve > max_w && cur_w > indent {
+            if lines.len() == 3 {
+                lines[2].push(Span::styled(format!(" Enter {}", tr("more")), Style::default().fg(Color::Gray)));
+                break;
+            }
+            lines.push(vec![Span::raw(" ".repeat(indent))]);
+            cur_w = indent;
+        }
+        cur_w += w;
+        let last = lines.last_mut().unwrap();
+        last.push(key);
+        last.push(label);
+    }
+    lines.into_iter().map(Line::from).collect()
+}
+
+/// Bottom status line: CPU · memory · network · disk, alerts and running tasks on the right.
+fn draw_status(f: &mut Frame, area: Rect, m: &MetricsData, extra: Option<(Option<usize>, usize)>) {
+    let lab = Style::default().fg(Color::DarkGray);
+    if !m.ok {
+        f.render_widget(Paragraph::new(Span::styled(" metrics unavailable", lab)), area);
+        return;
+    }
+    let spark = area.width >= 130;
+    let coarse = if m.coarse { "~" } else { "" };
+    let mf = if m.mem_total > 0.0 { m.mem_used / m.mem_total } else { 0.0 };
+    let mut s: Vec<Span> = vec![Span::styled(" CPU ", lab), Span::styled(format!("{:.0}%", m.cpu * 100.0), usage_style(m.cpu))];
+    if spark {
+        s.push(Span::styled(format!(" {}", sparkline(&m.cpu_hist, 10, Some(1.0))), Style::default().fg(ACCENT)));
+        s.push(Span::styled(format!("  load {:.2}", m.load[0]), lab));
+    }
+    s.push(Span::styled(format!("   {} ", tr("Memory")), lab));
+    s.push(Span::styled(format!("{:.0}%", mf * 100.0), usage_style(mf)));
+    if spark {
+        s.push(Span::styled(format!(" {}/{}", fmt_bytes(m.mem_used), fmt_bytes(m.mem_total)), lab));
+    }
+    s.push(Span::styled(format!("   {} ", tr("Network")), lab));
+    s.push(Span::raw(if spark { format!("{coarse}↓{} ↑{}", fmt_rate(m.net_rx), fmt_rate(m.net_tx)) } else { format!("↓{} ↑{}", fmt_bytes(m.net_rx), fmt_bytes(m.net_tx)) }));
+    s.push(Span::styled(format!("   {} ", tr("Disk")), lab));
+    s.push(Span::raw(if spark { format!("{coarse}R {} W {}", fmt_rate(m.disk_r), fmt_rate(m.disk_w)) } else { format!("R {} W {}", fmt_bytes(m.disk_r), fmt_bytes(m.disk_w)) }));
+    if spark && !m.coarse {
+        s.push(Span::styled(format!("   {} proc · {} thr", m.procs, m.threads), lab));
+    }
+    let mut right: Vec<Span> = Vec::new();
+    if let Some((alerts, tasks)) = extra {
+        if tasks > 0 {
+            right.push(Span::styled(format!("◷ {tasks} {}  ", tr("Tasks")), Style::default().fg(ACCENT)));
+        }
+        if let Some(n) = alerts.filter(|n| *n > 0) {
+            right.push(Span::styled(format!("● {n} {} ", tr("Alerts")), style_bad()));
+        }
+    }
+    let rw: usize = right.iter().map(|x| x.width()).sum();
+    let parts = hsplit(area, &[Constraint::Min(10), Constraint::Length(rw as u16)]);
+    f.render_widget(Paragraph::new(Line::from(s)), parts[0]);
+    f.render_widget(Paragraph::new(Line::from(right)), parts[1]);
+}
+
+/// Extra column on very wide terminals: bigger live graphs.
+fn draw_metrics_panel(f: &mut Frame, area: Rect, m: &MetricsData) {
+    let w = (area.width as usize).saturating_sub(2);
+    let mut lines = Vec::new();
+    let mut graph = |title: String, h: &[f64], max: Option<f64>| {
+        lines.push(Line::from(Span::styled(title, ui::style_label())));
+        lines.push(Line::from(Span::styled(sparkline(h, w, max), Style::default().fg(ACCENT))));
+        lines.push(Line::from(""));
+    };
+    graph(format!("CPU {:.0}%  iowait {:.0}%", m.cpu * 100.0, m.iowait * 100.0), &m.cpu_hist, Some(1.0));
+    graph(format!("{} {} / {}", tr("Memory"), fmt_bytes(m.mem_used), fmt_bytes(m.mem_total)), &m.mem_hist, Some(1.0));
+    graph(format!("{} ↓{} ↑{}", tr("Network"), fmt_rate(m.net_rx), fmt_rate(m.net_tx)), &m.net_hist, None);
+    graph(format!("{} R {} W {}", tr("Disk"), fmt_rate(m.disk_r), fmt_rate(m.disk_w)), &m.disk_hist, None);
+    if m.arc_size > 0.0 {
+        lines.push(Line::from(format!("ZFS ARC {}", fmt_bytes(m.arc_size))));
+    }
+    f.render_widget(Paragraph::new(lines).block(ui::block("Live", false)), area);
+}
+
+/// Cluster/node health problems shown as the alert count in the status bar.
+fn collect_alerts(api: &Api, node: &str, exec: Option<crate::exec::Exec>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(v) = api.get("/cluster/status") {
+        for e in jarr(&v) {
+            match js(&e, "type").as_str() {
+                "cluster" if jf(&e, "quorate") == 0.0 => out.push(format!("cluster {} is NOT quorate", js(&e, "name"))),
+                "node" if jf(&e, "online") == 0.0 => out.push(format!("node {} is offline", js(&e, "name"))),
+                _ => {}
+            }
+        }
+    }
+    if let Ok(v) = api.get(&format!("/nodes/{node}/disks/zfs")) {
+        for p in jarr(&v) {
+            let h = js(&p, "health");
+            if h != "ONLINE" {
+                out.push(format!("ZFS pool {} is {h}", js(&p, "name")));
+            }
+        }
+    }
+    if let Ok(v) = api.get(&format!("/nodes/{node}/ceph/status")) {
+        if let Some(h) = v.get("health") {
+            let s = js(h, "status");
+            if !s.is_empty() && s != "HEALTH_OK" {
+                out.push(format!("Ceph {s}"));
+            }
+        }
+    }
+    if let Ok(v) = api.get(&format!("/nodes/{node}/storage")) {
+        for s in jarr(&v) {
+            let frac = jf(&s, "used_fraction");
+            if frac >= 0.9 && jf(&s, "active") != 0.0 {
+                out.push(format!("storage {} is {:.0}% full", js(&s, "storage"), frac * 100.0));
+            }
+        }
+    }
+    if let Some(exec) = exec {
+        if let Ok(o) = exec.output("systemctl", &["--failed", "--no-legend", "--plain", "--type=service"]) {
+            for l in o.lines() {
+                if let Some(u) = l.split_whitespace().next() {
+                    out.push(format!("unit {u} failed"));
                 }
             }
         }
     }
-
-    info
+    out
 }
 
-fn cidr_to_netmask(cidr: u8) -> String {
-    let mask: u32 = if cidr >= 32 { !0 } else { !0 << (32 - cidr) };
-    format!(
-        "{}.{}.{}.{}",
-        (mask >> 24) & 0xFF,
-        (mask >> 16) & 0xFF,
-        (mask >> 8) & 0xFF,
-        mask & 0xFF
-    )
-}
+const HELP_EN: &str = "\
+Global keys
+  F1-F5 / Tab         switch module (System, Network, Disks, Services & Logs, PVE)
+  1-9 / [ ]           switch submenu
+  Left/Right (h/l)    move between columns (menu, list, details)
+  Up/Down (j/k)       move in lists, PgUp/PgDn, Home/End
+  Enter / m           context menu with all actions for the selection
+  letters             direct actions (shown in the menu); UPPERCASE = forced/dangerous variant
+  Space               mark multiple rows (batch actions)
+  /                   filter the list (each page remembers its filter), Esc clears
+  r / Ctrl-R          refresh, a = toggle auto-refresh
+  F6                  switch node (cluster)
+  F8                  task center
+  F10                 shell (root@pam)
+  g                   global menu
+  q                   log out
+  Ctrl+Q              quit (only in ssh / terminal emulators, not on tty1)
 
-fn netmask_to_cidr_num(netmask: &str) -> u8 {
-    netmask
-        .split('.')
-        .filter_map(|s| s.parse::<u8>().ok())
-        .map(|b| b.count_ones() as u8)
-        .sum()
-}
+Log viewer
+  Space follow/pause, / search, n/N next/prev, & show only matches,
+  p priority, t time range, + load more, w export, Esc close
 
-fn is_network_input_char(c: char) -> bool {
-    c.is_ascii_digit() || c == '.'
-}
+Forms
+  Tab/Up/Down move, Left/Right change choice, Enter on a list opens a picker,
+  Ctrl-S submit, Esc cancel";
 
-fn is_valid_netmask(value: &str) -> bool {
-    let Ok(addr) = value.parse::<std::net::Ipv4Addr>() else {
-        return false;
-    };
+const HELP_ZH: &str = "\
+全局按键
+  F1-F5 / Tab         切换模块（系统、网络、磁盘、服务日志、PVE）
+  1-9 / [ ]           切换子菜单
+  左右 (h/l)          在栏之间移动（菜单、列表、详情）
+  上下 (j/k)          列表移动，PgUp/PgDn、Home/End
+  Enter / m           对选中项打开操作菜单
+  字母                直接执行菜单里的操作；大写 = 强制/危险版本
+  空格                多选（批量操作）
+  /                   过滤列表（每个页面单独记住），Esc 清除
+  r / Ctrl-R          刷新，a = 自动刷新开关
+  F6                  切换节点（集群）
+  F8                  任务中心
+  F10                 Shell（仅 root@pam）
+  g                   全局菜单
+  q                   登出
+  Ctrl+Q              退出程序（仅 SSH / 终端里可用，tty1 上不能退出）
 
-    let mask = u32::from(addr);
-    let inverted = !mask;
-    (inverted & (inverted + 1)) == 0
-}
+日志查看器
+  空格 跟随/暂停，/ 搜索，n/N 下一个/上一个，& 只显示匹配行，
+  p 优先级，t 时间范围，+ 加载更多，w 导出，Esc 关闭
 
-fn parse_ipv4_field(value: &str, field_name: &str) -> Result<std::net::Ipv4Addr, String> {
-    value
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|_| format!("Invalid {}", field_name))
-}
-
-fn validate_network_config(info: &NetworkInfo) -> Result<(), String> {
-    let ip = parse_ipv4_field(&info.ip, "IP address")?;
-    let gateway = parse_ipv4_field(&info.gateway, "gateway")?;
-
-    if !is_valid_netmask(&info.netmask) {
-        return Err("Invalid netmask".to_string());
-    }
-
-    let netmask = parse_ipv4_field(&info.netmask, "netmask")?;
-    let mask = u32::from(netmask);
-    let prefix = mask.count_ones();
-
-    if prefix == 0 || prefix >= 31 {
-        return Err("Netmask must be between /1 and /30".to_string());
-    }
-
-    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
-        return Err("IP address must be a usable unicast host address".to_string());
-    }
-
-    if gateway.is_unspecified() || gateway.is_loopback() || gateway.is_multicast() {
-        return Err("Gateway must be a usable unicast host address".to_string());
-    }
-
-    let ip_u32 = u32::from(ip);
-    let gateway_u32 = u32::from(gateway);
-    let network = ip_u32 & mask;
-    let broadcast = network | !mask;
-
-    if ip_u32 == network || ip_u32 == broadcast {
-        return Err("IP address cannot be the network or broadcast address".to_string());
-    }
-
-    if gateway_u32 == network || gateway_u32 == broadcast {
-        return Err("Gateway cannot be the network or broadcast address".to_string());
-    }
-
-    if ip == gateway {
-        return Err("IP address cannot be the same as gateway".to_string());
-    }
-
-    if (gateway_u32 & mask) != network {
-        return Err("Gateway must be in the same subnet as the IP address".to_string());
-    }
-
-    Ok(())
-}
-
-fn detect_physical_interfaces() -> Vec<NetIface> {
-    let mut interfaces = Vec::new();
-
-    // List all interfaces from /sys/class/net
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            
-            // Skip virtual interfaces
-            if name.starts_with("lo") 
-                || name.starts_with("veth")
-                || name.starts_with("vmbr")
-                || name.starts_with("tap")
-                || name.starts_with("fwbr")
-                || name.starts_with("fwpr")
-                || name.starts_with("fwln")
-            {
-                continue;
-            }
-
-            // Check if it's a physical device (has /device symlink)
-            let device_path = format!("/sys/class/net/{}/device", name);
-            if !std::path::Path::new(&device_path).exists() {
-                continue;
-            }
-
-            // Get MAC address
-            let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", name))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            // Bring up interface to check carrier
-            let _ = Command::new("ip")
-                .args(["link", "set", &name, "up"])
-                .status();
-
-            // Small delay for carrier detection
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // Check carrier
-            let carrier = std::fs::read_to_string(format!("/sys/class/net/{}/carrier", name))
-                .unwrap_or_default()
-                .trim()
-                .parse::<u8>()
-                .unwrap_or(0);
-
-            interfaces.push(NetIface {
-                name,
-                mac,
-                has_carrier: carrier == 1,
-            });
-        }
-    }
-
-    interfaces
-}
-
-impl App {
-    fn clear_password_form(&mut self) {
-        scrub_string(&mut self.password);
-        scrub_string(&mut self.password_confirm);
-        self.password_field = 0;
-    }
-
-    fn clear_secret_fields(&mut self) {
-        scrub_string(&mut self.login_password);
-        self.clear_password_form();
-    }
-}
+表单
+  Tab/上下 移动，左右 切换选项，在列表项上按 Enter 打开选择器，
+  Ctrl-S 提交，Esc 取消";
