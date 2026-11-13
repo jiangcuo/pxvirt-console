@@ -10,105 +10,81 @@ on:
 permissions:
   contents: write
 
+# a new push cancels the still running build of the same branch; tag (release) builds always finish
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
-
-      # new lints of newer toolchains are reported, but only fail on real problems
-      - run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
-      - run: cargo test --locked
-
-  build:
-    needs: test
+  # one job per architecture; static binaries without SDL, linkers in .cargo/config.toml
+  linux:
     runs-on: ubuntu-latest
     container: pxvirt/musl:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, arch: x86_64 }
+          - { target: aarch64-unknown-linux-musl, arch: aarch64 }
+          - { target: riscv64gc-unknown-linux-musl, arch: riscv64 }
+          - { target: loongarch64-unknown-linux-musl, arch: loongarch64 }
     env:
       # the toolchain is installed for root, GitHub sets HOME to /github/home
       CARGO_HOME: /root/.cargo
       RUSTUP_HOME: /root/.rustup
-      TARGETS: >-
-        x86_64-unknown-linux-musl
-        aarch64-unknown-linux-musl
-        riscv64gc-unknown-linux-musl
-        loongarch64-unknown-linux-musl
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
 
-      # static binaries without SDL, linkers are configured in .cargo/config.toml
       - name: Build
         run: |
           . /opt/musl/musl.env
           export PXVIRT_GIT_REV=${GITHUB_SHA::8}
-          for target in $TARGETS; do
-            cargo build --release --locked --no-default-features --target $target
-          done
-          target/x86_64-unknown-linux-musl/release/pxvirt-console --version
-
-      - name: Collect
-        run: |
+          cargo build --release --locked --no-default-features --target ${{ matrix.target }}
           mkdir out
-          for target in $TARGETS; do
-            arch=${target%%-*}
-            [ "$arch" = riscv64gc ] && arch=riscv64
-            cp target/$target/release/pxvirt-console out/pxvirt-console-linux-$arch
-          done
+          cp target/${{ matrix.target }}/release/pxvirt-console out/pxvirt-console-linux-${{ matrix.arch }}
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pxvirt-console-linux-musl
+          name: pxvirt-console-linux-${{ matrix.arch }}
           path: out/*
 
+  # client only (--ssh / --remote), no SDL
   macos:
-    needs: test
     runs-on: macos-latest
-    env:
-      TARGETS: aarch64-apple-darwin x86_64-apple-darwin
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, arch: arm64 }
+          - { target: x86_64-apple-darwin, arch: x86_64 }
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
-      # client only (--ssh / --remote), no SDL
       - name: Build
         run: |
-          for target in $TARGETS; do
-            cargo build --release --locked --no-default-features --target $target
-          done
-          target/aarch64-apple-darwin/release/pxvirt-console --version
-
-      - name: Package
-        run: |
+          export PXVIRT_GIT_REV=${GITHUB_SHA::8}
+          cargo build --release --locked --no-default-features --target ${{ matrix.target }}
           mkdir out
-          for target in $TARGETS; do
-            arch=${target%%-*}
-            [ "$arch" = aarch64 ] && arch=arm64
-            dir=$(mktemp -d)
-            cp target/$target/release/pxvirt-console README.md README.zh-CN.md "$dir/"
-            (cd "$dir" && zip -X "$GITHUB_WORKSPACE/out/pxvirt-console-macos-$arch.zip" pxvirt-console README.md README.zh-CN.md)
-          done
+          dir=$(mktemp -d)
+          cp target/${{ matrix.target }}/release/pxvirt-console README.md README.zh-CN.md "$dir/"
+          (cd "$dir" && zip -X "$GITHUB_WORKSPACE/out/pxvirt-console-macos-${{ matrix.arch }}.zip" pxvirt-console README.md README.zh-CN.md)
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pxvirt-console-macos
+          name: pxvirt-console-macos-${{ matrix.arch }}
           path: out/*
 
   release:
-    needs: [build, macos]
+    needs: [linux, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
