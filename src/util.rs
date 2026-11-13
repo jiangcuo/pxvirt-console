@@ -57,16 +57,6 @@ pub fn js(v: &Value, key: &str) -> String {
     }
 }
 
-/// Like `js` but with a default for missing/empty values.
-pub fn jsd(v: &Value, key: &str, default: &str) -> String {
-    let s = js(v, key);
-    if s.is_empty() {
-        default.to_string()
-    } else {
-        s
-    }
-}
-
 pub fn jf(v: &Value, key: &str) -> f64 {
     match v.get(key) {
         Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),

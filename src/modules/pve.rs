@@ -19,7 +19,7 @@ use crate::ui::form::{self, Form};
 use crate::ui::popup::{item, MenuItem, Popup};
 use crate::ui::table::{col, Row, Table};
 use crate::ui::{draw_lines, loading_or_error, status_style, style_bad, style_dim, style_good, style_warn, usage_style, Kv, ACCENT};
-use crate::util::{bar, fmt_bytes, fmt_duration, fmt_time, jarr, jb, jf, ji, js, jsd, urlenc};
+use crate::util::{bar, fmt_bytes, fmt_duration, fmt_time, jarr, jb, jf, ji, js, urlenc};
 
 pub fn views() -> Vec<Box<dyn View>> {
     vec![
@@ -310,6 +310,8 @@ struct Guests {
     create: Option<(bool, Job<CreateInfo>)>,
     nodes_for_form: Vec<String>,
     initialized: bool,
+    /// configuration page of one guest (Esc returns to the list)
+    cfg: Option<super::guestcfg::GuestCfg>,
 }
 
 const GFILTERS: [&str; 7] = ["all", "running", "stopped", "VM", "CT", "foreign arch", "templates"];
@@ -348,6 +350,17 @@ impl Guests {
 
     fn base(g: &Value) -> String {
         format!("/nodes/{}/{}/{}", js(g, "node"), js(g, "type"), js(g, "vmid"))
+    }
+
+    /// Leave the configuration page; the list reloads the (changed) config.
+    fn close_cfg(&mut self) {
+        self.cfg = None;
+        if let Some(k) = self.table.selected().map(|s| s.to_string()) {
+            self.confs.remove(&k);
+            if let Some(d) = self.detail.get_mut(&k) {
+                d.at = None;
+            }
+        }
     }
 
     fn power(&mut self, ctx: &mut Ctx, cmd: &str, label: &str) {
@@ -389,6 +402,10 @@ impl View for Guests {
     }
 
     fn refresh(&mut self, ctx: &mut Ctx) {
+        if let Some(c) = &mut self.cfg {
+            c.refresh(ctx);
+            return;
+        }
         if !self.initialized {
             self.table.multi = true;
             self.initialized = true;
@@ -405,6 +422,9 @@ impl View for Guests {
     }
 
     fn poll(&mut self, ctx: &mut Ctx) -> bool {
+        if let Some(c) = &mut self.cfg {
+            return c.poll(ctx);
+        }
         let mut ch = self.data.poll();
         if self.batch.poll() {
             if let Some(b) = self.batch.data.take() {
@@ -544,14 +564,27 @@ impl View for Guests {
     }
 
     fn table(&mut self) -> Option<&mut Table> {
+        if let Some(c) = &mut self.cfg {
+            return Some(c.table());
+        }
         Some(&mut self.table)
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if let Some(c) = &self.cfg {
+            return c.hints();
+        }
         vec![("Space", "mark"), ("f", "show"), ("o", "sort")]
     }
 
-    fn on_key(&mut self, key: &KeyEvent, _ctx: &mut Ctx) -> bool {
+    fn on_key(&mut self, key: &KeyEvent, ctx: &mut Ctx) -> bool {
+        if let Some(c) = &mut self.cfg {
+            if key.code == KeyCode::Esc {
+                self.close_cfg();
+                return true;
+            }
+            return c.on_key(key, ctx);
+        }
         match key.code {
             KeyCode::Char('f') => {
                 self.filter_mode = (self.filter_mode + 1) % GFILTERS.len();
@@ -566,6 +599,9 @@ impl View for Guests {
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx, focused: bool) {
+        if let Some(c) = &mut self.cfg {
+            return c.draw_list(f, area, focused);
+        }
         let mut list: Vec<Value> = self.data.data.clone().unwrap_or_default();
         list.retain(|g| {
             let running = js(g, "status") == "running";
@@ -633,6 +669,9 @@ impl View for Guests {
     }
 
     fn draw_detail(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx, focused: bool) {
+        if let Some(c) = &mut self.cfg {
+            return c.draw_detail(f, area, focused);
+        }
         let mut kv = Kv::new();
         if let Some(g) = self.sel().cloned() {
             let k = gkey(&g);
@@ -722,10 +761,16 @@ impl View for Guests {
     }
 
     fn scroll_detail(&mut self, d: i32) {
+        if let Some(c) = &mut self.cfg {
+            return c.scroll_detail(d);
+        }
         scroll(&mut self.scroll, d);
     }
 
     fn menu_title(&self) -> String {
+        if let Some(c) = &self.cfg {
+            return c.menu_title();
+        }
         let t = self.table.targets();
         if t.len() > 1 {
             format!("{} ({} {})", tr("Actions"), t.len(), tr("Guests"))
@@ -735,6 +780,9 @@ impl View for Guests {
     }
 
     fn menu(&self, ctx: &Ctx) -> Vec<MenuItem> {
+        if let Some(c) = &self.cfg {
+            return c.menu(ctx);
+        }
         let create = ctx.need_priv("/vms", "VM.Allocate");
         let mut v = Vec::new();
         if let Some(g) = self.sel() {
@@ -767,7 +815,7 @@ impl View for Guests {
                     item('b', "Backup now").require(ctx.need_priv(&path, "VM.Backup")),
                     item('M', "Migrate").require(ctx.need_priv(&path, "VM.Migrate")).disabled_if(ctx.nodes.len() < 2, "single node"),
                     item('C', "Clone").require(ctx.need_priv(&path, "VM.Clone")),
-                    item('e', "Edit").require(ctx.need_priv(&path, "VM.Config.Options")),
+                    item('e', "Configuration").require(ctx.need_priv(&path, "VM.Audit")),
                     item('H', "Add to / remove from HA").require(ctx.need_priv("/", "Sys.Console")),
                     item('U', "Unlock").require(ctx.need_root()).disabled_if(js(g, "lock").is_empty(), "not locked"),
                     item('X', "Delete").require(ctx.need_priv(&path, "VM.Allocate")).disabled_if(running, "stop it first"),
@@ -780,6 +828,9 @@ impl View for Guests {
     }
 
     fn on_menu(&mut self, tag: &str, key: char, ctx: &mut Ctx) {
+        if let Some(c) = &mut self.cfg {
+            return c.on_menu(tag, key, ctx);
+        }
         match tag {
             "snaps" => {
                 if key == '+' {
@@ -932,28 +983,8 @@ impl View for Guests {
                 )));
             }
             'e' => {
-                let c = self.confs.get(&gkey(&g)).cloned().unwrap_or(Value::Null);
-                let fields = if is_vm {
-                    vec![
-                        form::text("name", "Name", &crate::util::guest_name(&js(&c, "name"))),
-                        form::number("sockets", "Sockets", &jsd(&c, "sockets", "1")),
-                        form::number("cores", "Cores", &jsd(&c, "cores", "1")),
-                        form::number("memory", "Memory (MiB)", &jsd(&c, "memory", "512")),
-                        form::check("onboot", "Start at boot", jb(&c, "onboot")),
-                        form::check("agent", "QEMU guest agent", js(&c, "agent").starts_with('1')),
-                        form::text("description", "Notes", js(&c, "description").lines().next().unwrap_or("")),
-                    ]
-                } else {
-                    vec![
-                        form::text("hostname", "Hostname", &crate::util::guest_name(&js(&c, "hostname"))),
-                        form::number("cores", "Cores", &jsd(&c, "cores", "1")),
-                        form::number("memory", "Memory (MiB)", &js(&c, "memory")),
-                        form::number("swap", "Swap (MiB)", &js(&c, "swap")),
-                        form::check("onboot", "Start at boot", jb(&c, "onboot")),
-                        form::text("description", "Notes", js(&c, "description").lines().next().unwrap_or("")),
-                    ]
-                };
-                ctx.popup(Popup::Form(Form::new(&format!("{} {id}", tr("Edit")), "edit", fields)));
+                self.cfg = Some(super::guestcfg::GuestCfg::new(&g, ctx));
+                self.scroll = 0;
             }
             'H' => {
                 let sid = format!("{}:{id}", if is_vm { "vm" } else { "ct" });
@@ -979,6 +1010,9 @@ impl View for Guests {
     }
 
     fn on_confirm(&mut self, tag: &str, ctx: &mut Ctx) {
+        if let Some(c) = &mut self.cfg {
+            return c.on_confirm(tag, ctx);
+        }
         match tag {
             "shutdown" => self.power(ctx, "shutdown", "Shutdown"),
             "stop" => self.power(ctx, "stop", "Stop"),
@@ -1011,6 +1045,9 @@ impl View for Guests {
     }
 
     fn on_form(&mut self, tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
+        if let Some(c) = &mut self.cfg {
+            return c.on_form(tag, v, ctx);
+        }
         if tag == "create_vm" || tag == "create_ct" {
             pve_create::submit(tag, v, ctx);
             return;
@@ -1070,32 +1107,13 @@ impl View for Guests {
                 }
                 ctx.api_call(format!("Clone {id} -> {}", fv(v, "newid")), "POST", format!("{base}/clone"), p);
             }
-            "edit" => {
-                let mut p: Vec<(&'static str, String)> = Vec::new();
-                let mut del = Vec::new();
-                let keys: &[&'static str] = if is_vm { &["name", "sockets", "cores", "memory", "onboot", "agent", "description"] } else { &["hostname", "cores", "memory", "swap", "onboot", "description"] };
-                for k in keys {
-                    let val = fv(v, k);
-                    if val.is_empty() {
-                        del.push(*k);
-                    } else if matches!(*k, "name" | "hostname") {
-                        p.push((k, crate::util::guest_name_encode(val)));
-                    } else {
-                        p.push((k, val.to_string()));
-                    }
-                }
-                if !del.is_empty() {
-                    p.push(("delete", del.join(",")));
-                }
-                ctx.api_call(format!("Edit {id}"), "PUT", format!("{base}/config"), p);
-                self.confs.remove(&gkey(&g));
-            }
             _ => {}
         }
     }
 
     fn reset(&mut self) {
         self.detail.clear();
+        self.cfg = None;
     }
 }
 

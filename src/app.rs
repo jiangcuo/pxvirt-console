@@ -372,6 +372,31 @@ impl App {
                     dump(self, &format!("{name}_menu"))?;
                     self.popups.clear();
                 }
+                // guest configuration page of the first guest: page, menu, add menu, first edit form
+                if self.modules[m].views[v].title() == "Guests" && self.modules[m].views[v].table().map(|t| t.selected().is_some()).unwrap_or(false) {
+                    use crossterm::event::{KeyCode, KeyEvent};
+                    self.on_key(KeyEvent::from(KeyCode::Char('e')));
+                    settle(self, 3000);
+                    dump(self, &format!("{name}_config"))?;
+                    self.open_context_menu();
+                    dump(self, &format!("{name}_config_menu"))?;
+                    self.popups.clear();
+                    self.on_key(KeyEvent::from(KeyCode::Char('+')));
+                    settle(self, 300);
+                    dump(self, &format!("{name}_config_add"))?;
+                    self.popups.clear();
+                    for (i, k) in ['e', 'e'].iter().enumerate() {
+                        if i == 1 {
+                            self.on_key(KeyEvent::from(KeyCode::Down));
+                        }
+                        self.on_key(KeyEvent::from(KeyCode::Char(*k)));
+                        settle(self, 300);
+                        dump(self, &format!("{name}_config_edit{i}"))?;
+                        self.popups.clear();
+                    }
+                    self.on_key(KeyEvent::from(KeyCode::Esc));
+                    settle(self, 300);
+                }
             }
         }
         self.open_global_menu();
