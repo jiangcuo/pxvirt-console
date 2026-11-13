@@ -179,6 +179,31 @@ pub fn is_root_process() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Check a local account password with pam_unix's `unix_chkpwd` helper (reads /etc/shadow,
+/// supports every hash the system does) instead of linking libpam.
+pub fn check_local_password(user: &str, password: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let helper = ["/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .ok_or_else(|| anyhow::anyhow!("unix_chkpwd not found"))?;
+    let mut child = Command::new(helper)
+        .args([user, "nullok"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    {
+        // The helper reads the password NUL-terminated from stdin (max 512 bytes).
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut buf = password.as_bytes().to_vec();
+        buf.push(0);
+        let _ = stdin.write_all(&buf);
+    }
+    Ok(child.wait()?.success())
+}
+
 pub fn local_hostname() -> String {
     let h = read_file("/etc/hostname");
     let h = h.trim();

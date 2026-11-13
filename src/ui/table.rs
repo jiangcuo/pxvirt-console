@@ -60,6 +60,9 @@ pub struct Table {
     keys: Vec<String>,
     page: usize,
     pub multi: bool,
+    /// Screen area of the data rows and the scroll offset of the last draw (for mouse clicks).
+    rows_area: Rect,
+    offset: usize,
 }
 
 impl Table {
@@ -160,6 +163,8 @@ impl Table {
             t = format!("{t} · {msg}");
         }
         let blk = block(&t, focused);
+        let inner = blk.inner(area);
+        self.rows_area = Rect::new(inner.x, inner.y.saturating_add(1), inner.width, inner.height.saturating_sub(1));
         if rows.is_empty() || vis.is_empty() {
             let (msg, st) = status.unwrap_or_else(|| (tr("No data").to_string(), style_dim()));
             f.render_widget(Paragraph::new(Line::from(Span::styled(msg, st))).block(blk), area);
@@ -217,5 +222,31 @@ impl Table {
             .highlight_spacing(HighlightSpacing::Always)
             .column_spacing(2);
         f.render_stateful_widget(table, area, &mut state);
+        self.offset = state.offset();
+    }
+
+    /// Mouse click at screen (x, y): select the row under it. Returns true if a row was hit.
+    pub fn click(&mut self, x: u16, y: u16) -> bool {
+        let r = self.rows_area;
+        if x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height {
+            return false;
+        }
+        let idx = self.offset + (y - r.y) as usize;
+        if idx < self.keys.len() {
+            self.set_sel(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mouse wheel: move the selection.
+    pub fn scroll(&mut self, delta: i32) {
+        let n = self.keys.len();
+        if n == 0 {
+            return;
+        }
+        let i = (self.sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize;
+        self.set_sel(i);
     }
 }

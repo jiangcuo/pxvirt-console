@@ -14,7 +14,6 @@ pub mod transport;
 
 use anyhow::{anyhow, bail, Result};
 use crossterm::{
-    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{style::Style, text::Span, widgets::Paragraph};
@@ -76,10 +75,10 @@ fn view(terminal: &mut Term, cfg: &Config, client: &mut Client, title: &str) -> 
     #[cfg(feature = "sdl")]
     if display == Display::Sdl {
         disable_raw_mode()?;
-        execute!(std::io::stdout(), LeaveAlternateScreen)?;
+        crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
         let r = sdl::run(client, title);
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
         terminal.clear()?;
         match r {
             Ok(()) => return Ok(()),

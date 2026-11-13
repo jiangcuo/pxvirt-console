@@ -1142,6 +1142,42 @@ impl Storage {
     }
 }
 
+impl Storage {
+    fn storage_content(&self, name: &str) -> String {
+        self.data.data.as_ref().and_then(|d| d.iter().find(|s| js(s, "storage") == name)).map(|s| js(s, "content")).unwrap_or_default()
+    }
+
+    /// Download-from-URL form (PVE downloads on the node itself, the console only starts it).
+    fn download_form(&self, storage: &str) -> Form {
+        let content = self.storage_content(storage);
+        let mut types = Vec::new();
+        if content.contains("iso") {
+            types.push(("iso".to_string(), "ISO image (.iso / .img)".to_string()));
+        }
+        if content.contains("vztmpl") {
+            types.push(("vztmpl".to_string(), "CT template (.tar.gz / .tar.xz / .tar.zst)".to_string()));
+        }
+        Form::new(
+            "Download from URL",
+            &format!("download:{storage}"),
+            vec![
+                form::info("Storage", storage),
+                form::text("url", "URL", "https://").req(true),
+                form::select("content", "Type", types, "iso"),
+                form::text("filename", "File name", "").help("empty = name reported by the server / last part of the URL"),
+                form::select(
+                    "algorithm",
+                    "Checksum",
+                    form::opts(&["none", "sha256", "sha512", "sha1", "md5", "sha224", "sha384"]),
+                    "none",
+                ),
+                form::text("checksum", "Checksum value", ""),
+                form::check("verify", "Verify TLS certificate", true),
+            ],
+        )
+    }
+}
+
 impl View for Storage {
     fn title(&self) -> &'static str {
         "Storage"
@@ -1327,7 +1363,13 @@ impl View for Storage {
         if let Some(s) = &self.browsing {
             let path = format!("/storage/{s}");
             let sel = self.ctable.selected().is_some();
-            return vec![item('x', "Delete volume").require(ctx.need_priv(&path, "Datastore.Allocate")).disabled_if(!sel, "nothing selected")];
+            let content = self.storage_content(s);
+            let tmpl = ctx.need_priv(&path, "Datastore.AllocateTemplate");
+            return vec![
+                item('w', "Download from URL").require(tmpl.clone()).disabled_if(!content.contains("iso") && !content.contains("vztmpl"), "no 'iso' / 'vztmpl' content"),
+                item('T', "Download CT template").require(tmpl).disabled_if(!content.contains("vztmpl"), "no 'vztmpl' content"),
+                item('x', "Delete volume").require(ctx.need_priv(&path, "Datastore.Allocate")).disabled_if(!sel, "nothing selected"),
+            ];
         }
         let Some(s) = self.sel() else { return vec![] };
         let path = format!("/storage/{}", js(s, "storage"));
@@ -1335,7 +1377,7 @@ impl View for Storage {
         let en = jb(s, "enabled");
         vec![
             item('b', "Browse content"),
-            item('w', "Download ISO from URL").require(ctx.need_priv(&path, "Datastore.AllocateTemplate")).disabled_if(!content.contains("iso"), "no 'iso' content"),
+            item('w', "Download from URL").require(ctx.need_priv(&path, "Datastore.AllocateTemplate")).disabled_if(!content.contains("iso") && !content.contains("vztmpl"), "no 'iso' / 'vztmpl' content"),
             item('T', "Download CT template").require(ctx.need_priv(&path, "Datastore.AllocateTemplate")).disabled_if(!content.contains("vztmpl"), "no 'vztmpl' content"),
             item(if en { 'E' } else { 'e' }, if en { "Disable storage" } else { "Enable storage" }).require(ctx.need_priv(&path, "Datastore.Allocate")),
         ]
@@ -1343,10 +1385,19 @@ impl View for Storage {
 
     fn on_menu(&mut self, _tag: &str, key: char, ctx: &mut Ctx) {
         if let Some(s) = self.browsing.clone() {
-            if key == 'x' {
-                if let Some(vol) = self.ctable.selected().map(|s| s.to_string()) {
-                    ctx.popup(Popup::confirm_typed("Delete volume", &format!("delvol:{s}:{vol}"), vec![format!("Delete {vol}?")], vol.rsplit('/').next().unwrap_or(&vol)));
+            match key {
+                'x' => {
+                    if let Some(vol) = self.ctable.selected().map(|s| s.to_string()) {
+                        ctx.popup(Popup::confirm_typed("Delete volume", &format!("delvol:{s}:{vol}"), vec![format!("Delete {vol}?")], vol.rsplit('/').next().unwrap_or(&vol)));
+                    }
                 }
+                'w' => ctx.popup(Popup::Form(self.download_form(&s))),
+                'T' => {
+                    let api = ctx.api.clone();
+                    let node = ctx.node.clone();
+                    self.templates = Some(Job::spawn(move || Ok(jarr(&api.get(&format!("/nodes/{node}/aplinfo"))?))));
+                }
+                _ => {}
             }
             return;
         }
@@ -1358,16 +1409,7 @@ impl View for Storage {
                 self.ctable = Table::default();
                 self.load_content(ctx);
             }
-            'w' => ctx.popup(Popup::Form(Form::new(
-                "Download ISO",
-                "iso",
-                vec![
-                    form::info("Storage", &s),
-                    form::text("url", "URL", "https://").req(true),
-                    form::text("filename", "File name", "").help("empty = last part of the URL"),
-                    form::text("checksum", "SHA256 (optional)", ""),
-                ],
-            ))),
+            'w' => ctx.popup(Popup::Form(self.download_form(&s))),
             'T' => {
                 let api = ctx.api.clone();
                 let node = ctx.node.clone();
@@ -1390,19 +1432,45 @@ impl View for Storage {
     fn on_form(&mut self, tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
         let n = ctx.node.clone();
         match tag {
-            "iso" => {
-                let Some(s) = self.sel().map(|s| js(s, "storage")) else { return };
-                let url = fv(v, "url").to_string();
-                let mut filename = fv(v, "filename").to_string();
-                if filename.is_empty() {
-                    filename = url.rsplit('/').next().unwrap_or("download.iso").split('?').next().unwrap_or("").to_string();
+            t if t.starts_with("download:") => {
+                let s = t["download:".len()..].to_string();
+                let url = fv(v, "url").trim().to_string();
+                if !(url.starts_with("http://") || url.starts_with("https://")) || url.len() < 10 {
+                    ctx.popup(Popup::error("Download from URL", "enter an http:// or https:// URL"));
+                    return;
                 }
-                let mut p = vec![("content", "iso".to_string()), ("url", url), ("filename", filename.clone())];
-                if !fv(v, "checksum").is_empty() {
-                    p.push(("checksum", fv(v, "checksum").to_string()));
-                    p.push(("checksum-algorithm", "sha256".into()));
-                }
-                ctx.api_call(format!("Download {filename}"), "POST", format!("/nodes/{n}/storage/{s}/download-url"), p);
+                let content = fv(v, "content").to_string();
+                let filename = fv(v, "filename").trim().to_string();
+                let algo = fv(v, "algorithm").to_string();
+                let checksum = fv(v, "checksum").trim().to_string();
+                let verify = fv(v, "verify").to_string();
+                let api = ctx.api.clone();
+                let title = format!("Download {}", if filename.is_empty() { url.rsplit('/').next().unwrap_or("") } else { &filename });
+                ctx.act(title, move || {
+                    // no name given: ask PVE for the server's file name (Content-Disposition / redirects)
+                    let mut name = filename;
+                    if name.is_empty() {
+                        if let Ok(meta) = api.get(&format!("/nodes/{n}/query-url-metadata?url={}&verify-certificates={verify}", urlenc(&url))) {
+                            name = js(&meta, "filename");
+                        }
+                    }
+                    if name.is_empty() {
+                        name = url.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or("").to_string();
+                    }
+                    if name.is_empty() {
+                        anyhow::bail!("could not determine a file name, enter one");
+                    }
+                    let mut p = vec![("content", content), ("url", url), ("filename", name), ("verify-certificates", verify)];
+                    if !checksum.is_empty() && algo != "none" {
+                        p.push(("checksum", checksum));
+                        p.push(("checksum-algorithm", algo));
+                    }
+                    let r = api.post(&format!("/nodes/{n}/storage/{s}/download-url"), &p)?;
+                    Ok(match crate::api::is_upid(&r) {
+                        Some(u) => crate::ctx::ActionOutcome::Upid(u),
+                        None => crate::ctx::ActionOutcome::Msg("download started".into()),
+                    })
+                });
             }
             "tmpl" => ctx.api_call(
                 format!("Download {}", fv(v, "template")),

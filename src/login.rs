@@ -1,7 +1,7 @@
 //! Pre-login dashboard (ESXi DCUI style) and login form.
 //!
 //! Login goes through POST /access/ticket (any PVE realm, TFA supported). When the API is
-//! unreachable, root@pam can still log in with the local password (pwcheck) into rescue mode,
+//! unreachable, root@pam can still log in with the local password (unix_chkpwd) into rescue mode,
 //! which talks to PVE through `pvesh`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -372,7 +372,7 @@ fn do_login(api: Arc<Api>, remote: bool, user: &str, realm: &str, password: &str
         },
         Err(e) => {
             if !remote && user == "root" && realm == "pam" && crate::util::is_root_process() {
-                if !matches!(pwcheck::pwcheck("root", password), pwcheck::PwcheckResult::Ok) {
+                if !crate::util::check_local_password("root", password)? {
                     anyhow::bail!("Invalid password");
                 }
                 let api = Arc::new(Api::pvesh());

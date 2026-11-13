@@ -1,0 +1,169 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
+
+      # new lints of newer toolchains are reported, but only fail on real problems
+      - run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    container: pxvirt/musl:latest
+    env:
+      # the toolchain is installed for root, GitHub sets HOME to /github/home
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
+      TARGETS: >-
+        x86_64-unknown-linux-musl
+        aarch64-unknown-linux-musl
+        riscv64gc-unknown-linux-musl
+        loongarch64-unknown-linux-musl
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # static binaries without SDL, linkers are configured in .cargo/config.toml
+      - name: Build
+        run: |
+          . /opt/musl/musl.env
+          export PXVIRT_GIT_REV=${GITHUB_SHA::8}
+          for target in $TARGETS; do
+            cargo build --release --locked --no-default-features --target $target
+          done
+          target/x86_64-unknown-linux-musl/release/pxvirt-console --version
+
+      - name: Collect
+        run: |
+          mkdir out
+          for target in $TARGETS; do
+            arch=${target%%-*}
+            [ "$arch" = riscv64gc ] && arch=riscv64
+            cp target/$target/release/pxvirt-console out/pxvirt-console-linux-$arch
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxvirt-console-linux-musl
+          path: out/*
+
+  macos:
+    needs: test
+    runs-on: macos-latest
+    env:
+      TARGETS: aarch64-apple-darwin x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      # client only (--ssh / --remote), no SDL
+      - name: Build
+        run: |
+          for target in $TARGETS; do
+            cargo build --release --locked --no-default-features --target $target
+          done
+          target/aarch64-apple-darwin/release/pxvirt-console --version
+
+      - name: Package
+        run: |
+          mkdir out
+          for target in $TARGETS; do
+            arch=${target%%-*}
+            [ "$arch" = aarch64 ] && arch=arm64
+            dir=$(mktemp -d)
+            cp target/$target/release/pxvirt-console README.md README.zh-CN.md "$dir/"
+            (cd "$dir" && zip -X "$GITHUB_WORKSPACE/out/pxvirt-console-macos-$arch.zip" pxvirt-console README.md README.zh-CN.md)
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxvirt-console-macos
+          path: out/*
+
+  release:
+    needs: [build, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pxvirt-console-*
+          path: out
+          merge-multiple: true
+
+      - run: cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      # "What's Changed": one line per pull request, or per commit pushed without one
+      - name: Release notes
+        run: |
+          repo=$GITHUB_REPOSITORY
+          url=https://github.com/$repo
+          tag=$GITHUB_REF_NAME
+          prev=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)
+          range=${prev:+$prev..}$tag
+          declare -A seen
+          {
+            echo "## What's Changed"
+            echo
+            for sha in $(git rev-list --reverse --no-merges "$range"); do
+              pr=$(gh api "repos/$repo/commits/$sha/pulls" \
+                --jq '[.[] | select(.merged_at != null)][0] | select(.) | "\(.number)\t\(.user.login)\t\(.title)"' 2>/dev/null || true)
+              if [ -n "$pr" ]; then
+                IFS=$'\t' read -r num login title <<< "$pr"
+                [ -n "${seen[$num]}" ] && continue
+                seen[$num]=1
+                echo "* $title by [@$login](https://github.com/$login) in [#$num]($url/pull/$num)"
+              else
+                login=$(gh api "repos/$repo/commits/$sha" --jq '.author.login // empty' 2>/dev/null || true)
+                subject=$(git log -1 --format=%s "$sha")
+                if [ -n "$login" ]; then by="[@$login](https://github.com/$login)"; else by=$(git log -1 --format=%an "$sha"); fi
+                echo "* $subject by $by in [\`${sha::7}\`]($url/commit/$sha)"
+              fi
+            done
+            echo
+            if [ -n "$prev" ]; then
+              echo "**Full Changelog**: $url/compare/$prev...$tag"
+            else
+              echo "**Full Changelog**: $url/commits/$tag"
+            fi
+          } > notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: pxvirt-console ${{ github.ref_name }}
+          body_path: notes.md
+          files: out/*

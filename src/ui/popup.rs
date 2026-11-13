@@ -47,6 +47,8 @@ pub struct Menu {
     pub tag: String,
     pub items: Vec<MenuItem>,
     pub sel: usize,
+    /// where the menu was drawn last (mouse hit testing)
+    pub rect: Rect,
 }
 
 pub enum ConfirmKind {
@@ -96,7 +98,7 @@ pub enum Outcome {
 impl Popup {
     pub fn menu(title: &str, tag: &str, items: Vec<MenuItem>) -> Self {
         let sel = items.iter().position(|i| i.disabled.is_none()).unwrap_or(0);
-        Popup::Menu(Menu { title: title.to_string(), tag: tag.to_string(), items, sel })
+        Popup::Menu(Menu { title: title.to_string(), tag: tag.to_string(), items, sel, rect: Rect::default() })
     }
 
     pub fn confirm(title: &str, tag: &str, body: Vec<String>, danger: bool) -> Self {
@@ -196,12 +198,50 @@ impl Popup {
 
     pub fn draw(&mut self, f: &mut Frame, area: Rect) {
         match self {
-            Popup::Menu(m) => draw_menu(f, area, m),
+            Popup::Menu(m) => m.rect = draw_menu(f, area, m),
             Popup::Confirm(c) => draw_confirm(f, area, c),
             Popup::Text(t) => draw_text(f, area, t),
             Popup::Form(fm) => fm.draw(f, area),
             Popup::Log(l) => l.draw(f, area),
             Popup::Task(t) => t.draw(f, area),
+        }
+    }
+
+    /// Mouse on a popup. Menus: click an item to run it, hover to select.
+    /// Wheel scrolls text, logs and task logs. A click outside a menu / message closes it.
+    pub fn handle_mouse(&mut self, m: &crossterm::event::MouseEvent, area: Rect) -> Outcome {
+        use crossterm::event::{KeyEvent, MouseButton, MouseEventKind};
+        let key = |c: KeyCode| KeyEvent::from(c);
+        match m.kind {
+            MouseEventKind::ScrollUp => return self.handle_key(&key(KeyCode::Up)),
+            MouseEventKind::ScrollDown => return self.handle_key(&key(KeyCode::Down)),
+            _ => {}
+        }
+        let down = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        match self {
+            Popup::Menu(menu) => {
+                let r = menu.rect;
+                let inside = m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height;
+                if !inside {
+                    return if down { Outcome::Close } else { Outcome::None };
+                }
+                let row = m.row.saturating_sub(r.y + 1) as usize;
+                if m.row > r.y && row < menu.items.len() {
+                    menu.sel = row;
+                    if down {
+                        let it = &menu.items[row];
+                        if it.disabled.is_none() {
+                            return Outcome::Menu(menu.tag.clone(), it.key);
+                        }
+                    }
+                }
+                Outcome::None
+            }
+            Popup::Text(_) if down => Outcome::Close,
+            _ => {
+                let _ = area;
+                Outcome::None
+            }
         }
     }
 
@@ -292,7 +332,7 @@ fn confirm_key(c: &mut Confirm, key: &KeyEvent) -> Outcome {
     }
 }
 
-fn draw_menu(f: &mut Frame, area: Rect, m: &Menu) {
+fn draw_menu(f: &mut Frame, area: Rect, m: &Menu) -> Rect {
     let w = m
         .items
         .iter()
@@ -323,6 +363,7 @@ fn draw_menu(f: &mut Frame, area: Rect, m: &Menu) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines).block(popup_block(&m.title)), r);
+    r
 }
 
 fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {

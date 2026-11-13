@@ -1,0 +1,28 @@
+# Static musl builds with the pxvirt/musl image (toolchains in /opt/musl/*/bin).
+# Build with --no-default-features (no SDL).
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-unknown-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-unknown-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "riscv64-unknown-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.loongarch64-unknown-linux-musl]
+linker = "loongarch64-unknown-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# C compilers for build scripts (ring)
+[env]
+CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc"
+AR_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-ar"
+CC_aarch64_unknown_linux_musl = "aarch64-unknown-linux-musl-gcc"
+AR_aarch64_unknown_linux_musl = "aarch64-unknown-linux-musl-ar"
+CC_riscv64gc_unknown_linux_musl = "riscv64-unknown-linux-musl-gcc"
+AR_riscv64gc_unknown_linux_musl = "riscv64-unknown-linux-musl-ar"
+CC_loongarch64_unknown_linux_musl = "loongarch64-unknown-linux-musl-gcc"
+AR_loongarch64_unknown_linux_musl = "loongarch64-unknown-linux-musl-ar"

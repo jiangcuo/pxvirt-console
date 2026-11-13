@@ -33,7 +33,9 @@ use super::rfb::{snapshot_rgb, Client};
 use crate::ui::{block, centered, unicode_width};
 use crate::Term;
 
-const KITTY_ID: u32 = 31;
+/// Two image ids used alternately (double buffering): the new frame is shown first and
+/// only then the previous one deleted, so the picture never blanks between frames.
+const KITTY_IDS: [u32; 2] = [31, 32];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Proto {
@@ -58,7 +60,7 @@ fn geometry(area: Rect, font: (u16, u16), fb: (usize, usize)) -> Geometry {
     Geometry { area, font, scale, cols, rows }
 }
 
-fn kitty_frame(out: &mut impl Write, g: &Geometry, img: &RgbImage) -> std::io::Result<()> {
+fn kitty_frame(out: &mut impl Write, g: &Geometry, img: &RgbImage, id: u32) -> std::io::Result<()> {
     // send at most the displayed pixel size
     let tw = ((g.cols as u32) * g.font.0 as u32).min(img.width()).max(1);
     let th = ((g.rows as u32) * g.font.1 as u32).min(img.height()).max(1);
@@ -80,7 +82,7 @@ fn kitty_frame(out: &mut impl Write, g: &Geometry, img: &RgbImage) -> std::io::R
         if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,f=24,o=z,s={},v={},i={KITTY_ID},p=1,q=2,C=1,c={},r={},m={more};",
+                "\x1b_Ga=T,f=24,o=z,s={},v={},i={id},p=1,q=2,C=1,c={},r={},m={more};",
                 img.width(),
                 img.height(),
                 g.cols,
@@ -95,9 +97,33 @@ fn kitty_frame(out: &mut impl Write, g: &Geometry, img: &RgbImage) -> std::io::R
     out.flush()
 }
 
-fn kitty_delete(out: &mut impl Write) {
-    let _ = write!(out, "\x1b_Ga=d,d=I,i={KITTY_ID},q=2\x1b\\");
+/// Delete (and free) one frame image.
+fn kitty_delete_id(out: &mut impl Write, id: u32) {
+    let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
     let _ = out.flush();
+}
+
+fn kitty_delete(out: &mut impl Write) {
+    for id in KITTY_IDS {
+        kitty_delete_id(out, id);
+    }
+}
+
+/// Terminals known to implement SGR-Pixels mouse reporting (DEC mode 1016).
+/// `PXVIRT_PIXEL_MOUSE=0/1` overrides the detection.
+fn pixel_mouse_supported(kitty_graphics: bool) -> bool {
+    if let Ok(v) = std::env::var("PXVIRT_PIXEL_MOUSE") {
+        return v == "1";
+    }
+    let term = std::env::var("TERM").unwrap_or_default();
+    let prog = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+    kitty_graphics
+        || std::env::var("KITTY_WINDOW_ID").is_ok()
+        || std::env::var("WEZTERM_EXECUTABLE").is_ok()
+        || matches!(prog.as_str(), "ghostty" | "wezterm")
+        || term.contains("kitty")
+        || term.contains("ghostty")
+        || term.starts_with("foot")
 }
 
 fn bar_buttons(acts: &[Act], x0: u16, y: u16, width: u16) -> Vec<Button> {
@@ -115,7 +141,9 @@ fn menu_rows(rect: Rect) -> Vec<Button> {
 }
 
 pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> Result<()> {
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let queried = Picker::from_query_stdio();
+    let font_known = queried.is_ok();
+    let mut picker = queried.unwrap_or_else(|_| Picker::halfblocks());
     let mut proto = match picker.protocol_type() {
         ProtocolType::Kitty => Proto::Kitty,
         p => Proto::Lib(p),
@@ -123,6 +151,12 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let mut stdout = std::io::stdout();
     execute!(stdout, EnableMouseCapture)?;
+    // SGR-Pixels (mode 1016): mouse positions in pixels instead of cells -> exact clicks
+    let pixel_mouse = font_known && pixel_mouse_supported(picker.protocol_type() == ProtocolType::Kitty);
+    if pixel_mouse {
+        write!(stdout, "\x1b[?1016h")?;
+        stdout.flush()?;
+    }
     if enhanced {
         let _ = execute!(stdout, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
     }
@@ -132,6 +166,9 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
     let mut sel: usize = 0;
     let interval = Duration::from_millis(1000 / fps.clamp(1, 60) as u64);
     let mut last_gen = u64::MAX;
+    // which of KITTY_IDS holds the frame on screen
+    let mut kitty_slot = 0usize;
+    let mut kitty_shown = false;
     let mut last_draw = Instant::now() - interval;
     let mut menu = false;
     let mut dirty_layout = true;
@@ -200,7 +237,14 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
                         client.tap(&mods, sym);
                     }
                 }
-                Event::Mouse(m) => {
+                Event::Mouse(mut m) => {
+                    // in pixel mode crossterm reports pixels; keep them and derive the cell
+                    let (pcol, prow) = (m.column, m.row);
+                    if pixel_mouse {
+                        let f = picker.font_size();
+                        m.column = pcol / f.width.max(1);
+                        m.row = prow / f.height.max(1);
+                    }
                     // The bar row and the menu panel are ours; everything else is forwarded.
                     let (col, row) = (m.column, m.row);
                     let on_menu = menu_rect.map(|r| r.contains((col, row).into())).unwrap_or(false);
@@ -269,14 +313,24 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
                     }
                     if let Some(g) = &geom {
                         let (fw, fh) = (g.font.0 as f64, g.font.1 as f64);
-                        let col = m.column.saturating_sub(g.area.x) as f64;
-                        let row = m.row.saturating_sub(g.area.y) as f64;
+                        // position inside the picture, in terminal pixels
+                        let (px, py) = if pixel_mouse {
+                            (pcol.saturating_sub(g.area.x * g.font.0) as f64, prow.saturating_sub(g.area.y * g.font.1) as f64)
+                        } else {
+                            ((m.column.saturating_sub(g.area.x) as f64 + 0.5) * fw, (m.row.saturating_sub(g.area.y) as f64 + 0.5) * fh)
+                        };
                         let (fbw, fbh) = {
                             let f = client.fb.lock().unwrap();
                             (f.w, f.h)
                         };
-                        let x = (((col + 0.5) * fw) / g.scale).clamp(0.0, fbw.saturating_sub(1) as f64) as u16;
-                        let y = (((row + 0.5) * fh) / g.scale).clamp(0.0, fbh.saturating_sub(1) as f64) as u16;
+                        // kitty stretches the picture to whole cells: use the real per-axis scale
+                        let (sx, sy) = if proto == Proto::Kitty {
+                            ((g.cols as f64 * fw) / fbw.max(1) as f64, (g.rows as f64 * fh) / fbh.max(1) as f64)
+                        } else {
+                            (g.scale, g.scale)
+                        };
+                        let x = (px / sx).clamp(0.0, fbw.saturating_sub(1) as f64) as u16;
+                        let y = (py / sy).clamp(0.0, fbh.saturating_sub(1) as f64) as u16;
                         let bit = |b: MouseButton| match b {
                             MouseButton::Left => 1u8,
                             MouseButton::Middle => 2,
@@ -286,7 +340,11 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
                         match m.kind {
                             MouseEventKind::Down(b) => client.pointer_event(x, y, cur | bit(b)),
                             MouseEventKind::Up(b) => client.pointer_event(x, y, cur & !bit(b)),
-                            MouseEventKind::Drag(_) | MouseEventKind::Moved => client.pointer_event(x, y, cur),
+                            MouseEventKind::Drag(_) | MouseEventKind::Moved => {
+                                client.pointer_event(x, y, cur);
+                                // the pointer is drawn by us: redraw even if the guest screen did not change
+                                dirty_layout = true;
+                            }
                             MouseEventKind::ScrollUp => {
                                 client.pointer_event(x, y, cur | 8);
                                 client.pointer_event(x, y, cur);
@@ -391,7 +449,13 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
             }
         })?;
         if proto == Proto::Kitty && !menu {
-            kitty_frame(&mut stdout, &g, &img)?;
+            let next = if kitty_shown { 1 - kitty_slot } else { kitty_slot };
+            kitty_frame(&mut stdout, &g, &img, KITTY_IDS[next])?;
+            if kitty_shown && next != kitty_slot {
+                kitty_delete_id(&mut stdout, KITTY_IDS[kitty_slot]);
+            }
+            kitty_slot = next;
+            kitty_shown = true;
         }
         geom = Some(g);
         dirty_layout = false;
@@ -402,6 +466,9 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
     }
     if enhanced {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    if pixel_mouse {
+        let _ = write!(stdout, "\x1b[?1016l");
     }
     execute!(stdout, DisableMouseCapture)?;
     terminal.clear()?;
@@ -425,7 +492,7 @@ mod tests {
         let g = geometry(Rect::new(0, 0, 80, 24), (10, 20), (640, 480));
         let img = RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 7]));
         let mut out = Vec::new();
-        kitty_frame(&mut out, &g, &img).unwrap();
+        kitty_frame(&mut out, &g, &img, KITTY_IDS[0]).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b_Ga=T,f=24,o=z"));
         assert!(s.ends_with("\x1b\\"));

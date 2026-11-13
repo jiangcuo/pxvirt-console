@@ -37,7 +37,6 @@ des = "0.8"
 
 # System
 libc = "0.2"
-pwcheck = "0.2"
 chrono = "0.4"
 
 # Optional graphical console

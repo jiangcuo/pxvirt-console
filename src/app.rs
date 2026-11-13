@@ -1,6 +1,6 @@
 //! Application state, key routing, layout and the main frame.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -60,6 +60,17 @@ pub struct SshTarget {
     pub user: String,
 }
 
+/// What a mouse click on the main screen lands on.
+#[derive(Clone, Copy, Debug)]
+enum Hit {
+    Tab(usize),
+    Sub(usize),
+    Action(char),
+    More,
+    List,
+    Detail,
+}
+
 pub struct App {
     pub ctx: Ctx,
     modules: Vec<Module>,
@@ -95,6 +106,9 @@ pub struct App {
     pub can_quit: bool,
     /// "Quit pxvirt-console?" is showing (works on every screen).
     confirm_quit: bool,
+    /// Clickable areas of the last frame.
+    hits: Vec<(Rect, Hit)>,
+    last_click: Option<(Instant, u16, u16)>,
     ssh: Option<SshTarget>,
 }
 
@@ -174,6 +188,8 @@ impl App {
             arch_job: None,
             can_quit: !crate::util::on_system_console(),
             confirm_quit: false,
+            hits: Vec::new(),
+            last_click: None,
             ssh,
         }
     }
@@ -199,6 +215,56 @@ impl App {
         let init = login::init_session(api, false)?;
         self.start_session(init);
         Ok(())
+    }
+
+    /// Debug helper: simulate mouse clicks on the recorded areas and report what happened.
+    pub fn debug_mouse_selftest(&mut self) -> String {
+        use crossterm::event::{KeyModifiers as KM, MouseButton as MB, MouseEvent as ME, MouseEventKind as MK};
+        let ev = |kind: MK, x: u16, y: u16| ME { kind, column: x, row: y, modifiers: KM::NONE };
+        let mut out = String::new();
+        let frame = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).expect("test backend");
+            for _ in 0..30 {
+                app.tick();
+                let _ = t.draw(|f| app.draw(f));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        frame(self);
+        let find = |app: &App, pred: &dyn Fn(&Hit) -> bool| app.hits.iter().find(|(_, h)| pred(h)).map(|(r, _)| (r.x + 1, r.y));
+        // module tab F3
+        if let Some((x, y)) = find(self, &|h| matches!(h, Hit::Tab(2))) {
+            self.on_mouse(ev(MK::Down(MB::Left), x, y));
+            out.push_str(&format!("click tab F3 -> module {}\n", self.cur + 1));
+        }
+        frame(self);
+        // submenu 2 of that module
+        if let Some((x, y)) = find(self, &|h| matches!(h, Hit::Sub(1))) {
+            self.on_mouse(ev(MK::Down(MB::Left), x, y));
+            out.push_str(&format!("click submenu 2 -> view {}\n", self.modules[self.cur].sel + 1));
+        }
+        // System > Processes: click the 3rd row, then right click it
+        self.goto(0, 2);
+        frame(self);
+        let before = self.modules[0].views[2].table().and_then(|t| t.selected().map(|s| s.to_string()));
+        if let Some((r, _)) = self.hits.iter().find(|(_, h)| matches!(h, Hit::List)).cloned() {
+            let (x, y) = (r.x + 4, r.y + 4);
+            self.on_mouse(ev(MK::Down(MB::Left), x, y));
+            let after = self.modules[0].views[2].table().and_then(|t| t.selected().map(|s| s.to_string()));
+            out.push_str(&format!("click process row 3 -> selection {before:?} -> {after:?}\n"));
+            self.on_mouse(ev(MK::Down(MB::Right), x, y));
+            out.push_str(&format!("right click row -> popups open: {}\n", self.popups.len()));
+            frame(self);
+            self.on_mouse(ev(MK::Down(MB::Left), 0, 0));
+            out.push_str(&format!("click outside menu -> popups open: {}\n", self.popups.len()));
+            self.on_mouse(ev(MK::ScrollDown, x, y));
+            let scrolled = self.modules[0].views[2].table().and_then(|t| t.selected().map(|s| s.to_string()));
+            out.push_str(&format!("wheel down -> selection {scrolled:?}\n"));
+        }
+        frame(self);
+        let chips: Vec<String> = self.hits.iter().filter_map(|(_, h)| if let Hit::Action(c) = h { Some(c.to_string()) } else { None }).collect();
+        out.push_str(&format!("action bar chips: {}\n", chips.join(" ")));
+        out
     }
 
     /// Debug helper: render the current screen as text.
@@ -743,47 +809,7 @@ impl App {
         if let Some((popup, origin)) = self.popups.last_mut() {
             let origin = *origin;
             let out = popup.handle_key(&key);
-            match out {
-                Outcome::None => {}
-                Outcome::Close => {
-                    if let Some((p, o)) = self.popups.pop() {
-                        if let Popup::Task(t) = p {
-                            if !t.done {
-                                self.bg_tasks.push((*t, o));
-                            } else {
-                                self.refresh_origin(o);
-                            }
-                        }
-                    }
-                }
-                Outcome::Menu(tag, k) => {
-                    self.popups.pop();
-                    match origin {
-                        Origin::Global => self.global_action(&tag, k),
-                        Origin::View(m, v) => {
-                            self.modules[m].views[v].on_menu(&tag, k, &mut self.ctx);
-                            self.process_cmds(origin);
-                        }
-                    }
-                }
-                Outcome::Confirmed(tag) => {
-                    self.popups.pop();
-                    match origin {
-                        Origin::Global => self.global_confirm(&tag),
-                        Origin::View(m, v) => {
-                            self.modules[m].views[v].on_confirm(&tag, &mut self.ctx);
-                            self.process_cmds(origin);
-                        }
-                    }
-                }
-                Outcome::Form(tag, values) => {
-                    self.popups.pop();
-                    if let Origin::View(m, v) = origin {
-                        self.modules[m].views[v].on_form(&tag, &values, &mut self.ctx);
-                        self.process_cmds(origin);
-                    }
-                }
-            }
+            self.apply_popup_outcome(out, origin);
             return;
         }
 
@@ -824,10 +850,18 @@ impl App {
             KeyCode::F(8) => return self.goto_title("Tasks"),
             KeyCode::F(10) => return self.open_shell(),
             KeyCode::Char('r') if ctrl => return self.refresh_current(true),
-            KeyCode::Tab => return self.goto((self.cur + 1) % self.modules.len(), self.modules[(self.cur + 1) % self.modules.len()].sel),
-            KeyCode::BackTab => {
-                let n = (self.cur + self.modules.len() - 1) % self.modules.len();
-                return self.goto(n, self.modules[n].sel);
+            // Tab moves between the list and the details (modules are F1-F5)
+            KeyCode::Tab | KeyCode::BackTab => {
+                if self.modules[m].views[v].has_detail() {
+                    if self.focus == Focus::Detail || self.narrow_detail {
+                        self.focus = Focus::List;
+                        self.narrow_detail = false;
+                    } else {
+                        self.focus = Focus::Detail;
+                        self.narrow_detail = self.width < 110;
+                    }
+                }
+                return;
             }
             KeyCode::Char(c @ '1'..='9') if !ctrl && !alt => {
                 let i = c as usize - '1' as usize;
@@ -854,25 +888,25 @@ impl App {
             KeyCode::Char('g') if !ctrl => return self.open_global_menu(),
             KeyCode::Char('g') if ctrl => return self.open_global_menu(),
             KeyCode::Char('?') => return self.open_help(),
-            KeyCode::Char('q') => {
-                if self.ssh.is_some() {
-                    // SSH mode: logging out disconnects, so ask first
-                    self.confirm_quit = true;
-                } else {
-                    self.logout();
-                }
-                return;
-            }
+            // Esc, innermost first: details -> filter -> the page's own "back" -> marks
             KeyCode::Esc => {
                 if self.narrow_detail || self.focus == Focus::Detail {
                     self.narrow_detail = false;
                     self.focus = Focus::List;
-                } else if let Some(t) = self.modules[m].views[v].table() {
+                    return;
+                }
+                if let Some(t) = self.modules[m].views[v].table() {
                     if !t.filter.is_empty() {
                         t.filter.clear();
-                    } else if !t.marked.is_empty() {
-                        t.marked.clear();
+                        return;
                     }
+                }
+                if self.modules[m].views[v].on_key(&key, &mut self.ctx) {
+                    self.process_cmds(origin);
+                    return;
+                }
+                if let Some(t) = self.modules[m].views[v].table() {
+                    t.marked.clear();
                 }
                 return;
             }
@@ -958,6 +992,136 @@ impl App {
     }
 
     /// A view's menu; in API-only remote mode actions that need host commands are hidden.
+    fn apply_popup_outcome(&mut self, out: Outcome, origin: Origin) {
+        match out {
+            Outcome::None => {}
+            Outcome::Close => {
+                if let Some((p, o)) = self.popups.pop() {
+                    if let Popup::Task(t) = p {
+                        if !t.done {
+                            self.bg_tasks.push((*t, o));
+                        } else {
+                            self.refresh_origin(o);
+                        }
+                    }
+                }
+            }
+            Outcome::Menu(tag, k) => {
+                self.popups.pop();
+                match origin {
+                    Origin::Global => self.global_action(&tag, k),
+                    Origin::View(m, v) => {
+                        self.modules[m].views[v].on_menu(&tag, k, &mut self.ctx);
+                        self.process_cmds(origin);
+                    }
+                }
+            }
+            Outcome::Confirmed(tag) => {
+                self.popups.pop();
+                match origin {
+                    Origin::Global => self.global_confirm(&tag),
+                    Origin::View(m, v) => {
+                        self.modules[m].views[v].on_confirm(&tag, &mut self.ctx);
+                        self.process_cmds(origin);
+                    }
+                }
+            }
+            Outcome::Form(tag, values) => {
+                self.popups.pop();
+                if let Origin::View(m, v) = origin {
+                    self.modules[m].views[v].on_form(&tag, &values, &mut self.ctx);
+                    self.process_cmds(origin);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mouse
+    // -----------------------------------------------------------------------
+
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        if matches!(m.kind, MouseEventKind::Moved) {
+            return;
+        }
+        self.note_activity();
+        if self.confirm_quit {
+            return;
+        }
+        let left = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        let right = matches!(m.kind, MouseEventKind::Down(MouseButton::Right));
+        match self.screen {
+            Screen::Dashboard => {
+                if left {
+                    self.screen = Screen::Login;
+                }
+                return;
+            }
+            Screen::Login => return,
+            Screen::Main => {}
+        }
+        if let Some((popup, origin)) = self.popups.last_mut() {
+            let origin = *origin;
+            let out = popup.handle_mouse(&m, Rect::default());
+            self.apply_popup_outcome(out, origin);
+            return;
+        }
+        let (mx, my) = (m.column, m.row);
+        let hit = self.hits.iter().find(|(r, _)| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height).map(|(_, h)| *h);
+        let (cm, cv) = (self.cur, self.modules[self.cur].sel);
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let d = if matches!(m.kind, MouseEventKind::ScrollUp) { -3 } else { 3 };
+                match hit {
+                    Some(Hit::Detail) => self.modules[cm].views[cv].scroll_detail(d),
+                    Some(Hit::List) => match self.modules[cm].views[cv].table() {
+                        Some(t) => t.scroll(d),
+                        None => self.modules[cm].views[cv].scroll_detail(d),
+                    },
+                    _ => {}
+                }
+                return;
+            }
+            _ => {}
+        }
+        if !left && !right {
+            return;
+        }
+        self.filter_edit = false;
+        match hit {
+            Some(Hit::Tab(i)) if left => self.goto(i, self.modules[i].sel),
+            Some(Hit::Sub(i)) if left => self.goto(cm, i),
+            Some(Hit::Action(c)) if left => {
+                if let Some(it) = self.view_menu(cm, cv).into_iter().find(|i| i.key == c) {
+                    match it.disabled {
+                        Some(reason) => self.toast(format!("{}: {reason}", tr(&it.label)), true),
+                        None => {
+                            self.modules[cm].views[cv].on_menu("ctx", c, &mut self.ctx);
+                            self.process_cmds(Origin::View(cm, cv));
+                        }
+                    }
+                }
+            }
+            Some(Hit::More) if left => self.open_context_menu(),
+            Some(Hit::Detail) => self.focus = Focus::Detail,
+            Some(Hit::List) => {
+                self.focus = Focus::List;
+                let on_row = self.modules[cm].views[cv].table().map(|t| t.click(mx, my)).unwrap_or(false);
+                if on_row {
+                    // right click or double click: open the action menu for that row
+                    let double = self.last_click.map(|(t, x, y)| t.elapsed() < Duration::from_millis(400) && x == mx && y == my).unwrap_or(false);
+                    if right || double {
+                        self.last_click = None;
+                        self.open_context_menu();
+                    } else {
+                        self.last_click = Some((Instant::now(), mx, my));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn view_menu(&self, m: usize, v: usize) -> Vec<MenuItem> {
         let mut items = self.modules[m].views[v].menu(&self.ctx);
         if self.ctx.remote {
@@ -1116,7 +1280,14 @@ impl App {
                 );
                 self.popups.push((Popup::text("About", &text), Origin::Global));
             }
-            'o' => self.logout(),
+            'o' => {
+                if self.ssh.is_some() {
+                    // SSH mode: logging out disconnects, so ask first
+                    self.confirm_quit = true;
+                } else {
+                    self.logout();
+                }
+            }
             'Q' => self.confirm_quit = true,
             _ => {}
         }
@@ -1190,7 +1361,8 @@ impl App {
 
         // action bar: every action of the current page, always visible
         let (cm, cv) = (self.cur, self.modules[self.cur].sel);
-        let action_lines = action_bar_lines(&self.view_menu(cm, cv), area.width);
+        self.hits.clear();
+        let (action_lines, chips) = action_bar_lines(&self.view_menu(cm, cv), area.width);
         let mut cons = vec![Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Min(3)];
         if self.filter_edit {
             cons.push(Constraint::Length(1));
@@ -1221,6 +1393,10 @@ impl App {
         }
         if !action_lines.is_empty() {
             f.render_widget(Paragraph::new(action_lines).style(ui::base()), rows[i]);
+            for (line, x, w, key) in chips {
+                let r = Rect::new(rows[i].x + x, rows[i].y + line, w, 1);
+                self.hits.push((r, key.map(Hit::Action).unwrap_or(Hit::More)));
+            }
             i += 1;
         }
         let alerts = self.alerts.data.as_ref().map(|a| a.len());
@@ -1270,10 +1446,14 @@ impl App {
     }
 
     /// Module tabs: F1..F5, the current one as a cyan block.
-    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
+    fn draw_tabs(&mut self, f: &mut Frame, area: Rect) {
         let mut spans = vec![Span::raw(" ")];
+        let mut x = area.x + 1;
         for (i, m) in self.modules.iter().enumerate() {
             let label = format!(" F{} {} ", i + 1, tr(m.title));
+            let w = ui::unicode_width(&label) as u16;
+            self.hits.push((Rect::new(x, area.y, w, 1), Hit::Tab(i)));
+            x += w + 1;
             if i == self.cur {
                 spans.push(Span::styled(label, Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)));
             } else {
@@ -1285,11 +1465,15 @@ impl App {
     }
 
     /// Submenu: 1..9, the current one as a white block.
-    fn draw_subtabs(&self, f: &mut Frame, area: Rect) {
+    fn draw_subtabs(&mut self, f: &mut Frame, area: Rect) {
         let m = &self.modules[self.cur];
         let mut spans = vec![Span::raw(" ")];
+        let mut x = area.x + 1;
         for (i, v) in m.views.iter().enumerate() {
             let label = format!(" {} {} ", i + 1, tr(v.title()));
+            let w = ui::unicode_width(&label) as u16;
+            self.hits.push((Rect::new(x, area.y, w, 1), Hit::Sub(i)));
+            x += w + 1;
             if i == m.sel {
                 spans.push(Span::styled(label, Style::default().bg(Color::Gray).fg(Color::Black).add_modifier(Modifier::BOLD)));
             } else {
@@ -1307,19 +1491,24 @@ impl App {
         let split = |a: Rect, c: &[Constraint]| Layout::default().direction(Direction::Horizontal).constraints(c.to_vec()).spacing(2).split(a).to_vec();
         let view = &mut self.modules[m].views[v];
         if !view.has_detail() {
+            self.hits.push((area, Hit::List));
             view.draw_list(f, area, &self.ctx, true);
             return;
         }
         if width < 110 {
             if self.narrow_detail {
+                self.hits.push((area, Hit::Detail));
                 view.draw_detail(f, area, &self.ctx, true);
             } else {
+                self.hits.push((area, Hit::List));
                 view.draw_list(f, area, &self.ctx, true);
             }
             return;
         }
         if width >= 200 {
             let parts = split(area, &[Constraint::Percentage(48), Constraint::Percentage(30), Constraint::Percentage(22)]);
+            self.hits.push((parts[0], Hit::List));
+            self.hits.push((parts[1], Hit::Detail));
             view.draw_list(f, parts[0], &self.ctx, focus == Focus::List);
             view.draw_detail(f, parts[1], &self.ctx, focus == Focus::Detail);
             if !view.draw_extra(f, parts[2], &self.ctx) {
@@ -1328,6 +1517,8 @@ impl App {
             return;
         }
         let parts = split(area, &[Constraint::Percentage(58), Constraint::Percentage(42)]);
+        self.hits.push((parts[0], Hit::List));
+        self.hits.push((parts[1], Hit::Detail));
         view.draw_list(f, parts[0], &self.ctx, focus == Focus::List);
         view.draw_detail(f, parts[1], &self.ctx, focus == Focus::Detail);
     }
@@ -1351,7 +1542,7 @@ impl App {
             if view.has_detail() && self.width < 110 {
                 hints.push(("→".into(), "details".into()));
             }
-            hints.extend([("/".into(), "filter".into()), ("F6".into(), "node".into()), ("?".into(), "help".into()), ("q".into(), if self.ssh.is_some() { "disconnect".into() } else { "logout".into() })]);
+            hints.extend([("/".into(), "filter".into()), ("F6".into(), "node".into()), ("?".into(), "help".into())]);
             if self.can_quit {
                 hints.push(("Ctrl+Q".into(), "Quit".into()));
             }
@@ -1369,9 +1560,13 @@ fn short_label(l: &str) -> String {
 
 /// The page's actions as "[key] label" chips, wrapped onto at most 3 lines.
 /// Disabled actions stay visible (dimmed) so users learn what exists.
-fn action_bar_lines(items: &[MenuItem], width: u16) -> Vec<Line<'static>> {
+/// Chip positions: (line, x, width, key) - key None = "Enter more".
+type Chips = Vec<(u16, u16, u16, Option<char>)>;
+
+fn action_bar_lines(items: &[MenuItem], width: u16) -> (Vec<Line<'static>>, Chips) {
+    let mut chips: Chips = Vec::new();
     if items.is_empty() {
-        return Vec::new();
+        return (Vec::new(), chips);
     }
     let max_w = width.saturating_sub(1) as usize;
     let mut lines: Vec<Vec<Span<'static>>> = vec![vec![Span::styled(format!(" {} ", tr("Actions")), Style::default().fg(Color::Gray))]];
@@ -1387,18 +1582,23 @@ fn action_bar_lines(items: &[MenuItem], width: u16) -> Vec<Line<'static>> {
         let reserve = if lines.len() == 3 { 10 } else { 0 };
         if cur_w + w + reserve > max_w && cur_w > indent {
             if lines.len() == 3 {
-                lines[2].push(Span::styled(format!(" Enter {}", tr("more")), Style::default().fg(Color::Gray)));
+                let more = Span::styled(format!(" Enter {}", tr("more")), Style::default().fg(Color::Gray));
+                chips.push((2, cur_w as u16, more.width() as u16, None));
+                lines[2].push(more);
                 break;
             }
             lines.push(vec![Span::raw(" ".repeat(indent))]);
             cur_w = indent;
+        }
+        if enabled {
+            chips.push(((lines.len() - 1) as u16, cur_w as u16, w as u16, Some(it.key)));
         }
         cur_w += w;
         let last = lines.last_mut().unwrap();
         last.push(key);
         last.push(label);
     }
-    lines.into_iter().map(Line::from).collect()
+    (lines.into_iter().map(Line::from).collect(), chips)
 }
 
 /// Bottom status line: CPU · memory · network · disk, alerts and running tasks on the right.
@@ -1512,7 +1712,8 @@ fn collect_alerts(api: &Api, node: &str, exec: Option<crate::exec::Exec>) -> Vec
 
 const HELP_EN: &str = "\
 Global keys
-  F1-F5 / Tab         switch module (System, Network, Disks, Services & Logs, PVE)
+  F1-F5               switch module (System, Network, Disks, Services & Logs, PVE)
+  Tab                 move between the list and the details
   1-9 / [ ]           switch submenu
   Left/Right (h/l)    move between columns (menu, list, details)
   Up/Down (j/k)       move in lists, PgUp/PgDn, Home/End
@@ -1525,7 +1726,9 @@ Global keys
   F8                  task center
   F10                 shell (root@pam)
   g                   global menu
-  q                   log out
+  mouse               click tabs, submenus, rows and action buttons; right click or
+                      double click a row for its menu; wheel scrolls
+  g then o            log out (in SSH mode: disconnect)
   Ctrl+Q              quit (only in ssh / terminal emulators, not on tty1)
 
 Log viewer
@@ -1538,7 +1741,8 @@ Forms
 
 const HELP_ZH: &str = "\
 全局按键
-  F1-F5 / Tab         切换模块（系统、网络、磁盘、服务日志、PVE）
+  F1-F5               切换模块（系统、网络、磁盘、服务日志、PVE）
+  Tab                 在列表和详情之间切换
   1-9 / [ ]           切换子菜单
   左右 (h/l)          在栏之间移动（菜单、列表、详情）
   上下 (j/k)          列表移动，PgUp/PgDn、Home/End
@@ -1551,7 +1755,8 @@ const HELP_ZH: &str = "\
   F8                  任务中心
   F10                 Shell（仅 root@pam）
   g                   全局菜单
-  q                   登出
+  鼠标                点击模块、子菜单、列表行、操作按钮；右键或双击行打开菜单；滚轮滚动
+  g 然后 o            登出（SSH 模式下是断开连接）
   Ctrl+Q              退出程序（仅 SSH / 终端里可用，tty1 上不能退出）
 
 日志查看器

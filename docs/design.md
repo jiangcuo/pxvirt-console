@@ -81,8 +81,8 @@
 
 1. **正常路径**：`POST /access/ticket`（用户名/密码/realm，含 TFA 时提示输入 OTP）→ 拿到用户自己的 ticket + CSRF。
    之后所有 API 操作**按该用户的 PVE ACL 生效**，界面根据 `GET /access/permissions` 隐藏/禁用无权限的操作。
-2. **救援路径**：8006 连不上时，只允许 `root@pam`，用现有 `pwcheck` 验证本机密码 → 进入“救援模式”（顶部红色 `RESCUE` 标记），只开放本地功能 + pvesh。
-3. **perl 生成票据**的用途：root@pam 已通过 pwcheck 验证、需要续期（ticket 2 小时过期）或 pveproxy 重启后恢复会话时，免再输密码；
+2. **救援路径**：8006 连不上时，只允许 `root@pam`，用 `unix_chkpwd` 验证本机密码 → 进入“救援模式”（顶部红色 `RESCUE` 标记），只开放本地功能 + pvesh。
+3. **perl 生成票据**的用途：root@pam 已通过 unix_chkpwd 验证、需要续期（ticket 2 小时过期）或 pveproxy 重启后恢复会话时，免再输密码；
    以及将来的“无人值守看板模式”。非 root 用户**不**使用伪造票据，避免越权。
 4. 本地命令和进入 Shell 的权限见下面 1.2.1。
 
@@ -134,7 +134,7 @@
 其他规则：
 
 - **登录前画面**：tty1 上未登录也显示主机名、管理 IP、`https://IP:8006`、版本和底部监控（只读，类似 ESXi DCUI）。能接触到物理控制台的人本来就能看到这些，风险可以接受；可配置关闭。
-- **救援模式**（pveproxy 不可用）：只允许 `root@pam` + pwcheck，这时拿不到 ACL，也不需要。
+- **救援模式**（pveproxy 不可用）：只允许 `root@pam` + unix_chkpwd，这时拿不到 ACL，也不需要。
 - **审计**：所有写操作写入 journal（`SYSLOG_IDENTIFIER=pxvirt-console`，记录操作者、节点、操作、结果）。API 操作 PVE 自己会记任务日志；本地命令靠这条补齐。
 - **伪造票据**：只给 `root@pam` 用。非 root 用户永远走 `/access/ticket`，不会让控制台变成提权的跳板。
 
@@ -507,7 +507,7 @@ src/
 src/
   main.rs        参数（--remote/--ssh/--lang/--vnc-test）、主循环、挂起 TUI 运行 shell/控制台
   app.rs         状态、按键路由、布局（顶栏/模块/子菜单/三栏/状态栏/提示栏）、全局菜单、告警
-  login.rs       登录前看板、登录（/access/ticket + TFA）、救援登录（pwcheck + pvesh）
+  login.rs       登录前看板、登录（/access/ticket + TFA）、救援登录（unix_chkpwd + pvesh）
   api.rs         PVE API 客户端（ticket/CSRF、TLS 指纹固定 + TOFU、pvesh 后备、perl 生成 root 票据）
   ctx.rs         Session（PVE 权限判断）、节点视角、命令出口（弹窗/后台操作/挂起/VNC）
   exec.rs        主机命令：本机或 ssh（集群其他节点）
@@ -561,7 +561,7 @@ src/
 | 模式 | 用法 | 说明 |
 |---|---|---|
 | 本机 | tty1 服务，或在节点上直接运行 | 全部功能；tty1/串口上不能退出，终端里 Ctrl+Q 退出 |
-| SSH | `pxvirt-console --ssh root@节点[:端口]` | 先建一条 SSH 主连接（ControlMaster），API 走端口转发，主机命令、shell、控制台、实时监控都复用这条连接；SSH 用户是 root 时自动以 root@pam 登录；其他集群节点从这台节点再 ssh 一跳；`q` = 断开 |
+| SSH | `pxvirt-console --ssh root@节点[:端口]` | 先建一条 SSH 主连接（ControlMaster），API 走端口转发，主机命令、shell、控制台、实时监控都复用这条连接；SSH 用户是 root 时自动以 root@pam 登录；其他集群节点从这台节点再 ssh 一跳；Ctrl+Q 断开 |
 | API | `pxvirt-console --remote 节点[:端口]` | 只用 API，证书指纹首次确认后记住；需要主机命令的页面（内存、进程、分区、路由、工具、流量、全部服务）和操作直接隐藏 |
 
 非 root 用户运行时，配置和证书指纹保存在 `~/.config/pxvirt-console/`。

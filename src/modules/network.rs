@@ -61,7 +61,20 @@ impl Interfaces {
         self.data.data.as_ref()?.ifaces.iter().find(|i| js(i, "iface") == k)
     }
 
-    fn edit_form(iface: &Value) -> Form {
+    /// Choices for port / slave / VLAN parent fields: (value, "name  type  [ip]").
+    fn device_opts(ifaces: &[Value], types: &[&str], exclude: &str) -> Vec<(String, String)> {
+        ifaces
+            .iter()
+            .filter(|i| types.contains(&js(i, "type").as_str()) && js(i, "iface") != exclude)
+            .map(|i| {
+                let name = js(i, "iface");
+                let extra = [js(i, "type"), js(i, "cidr")].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("  ");
+                (name.clone(), format!("{name:<14} {extra}"))
+            })
+            .collect()
+    }
+
+    fn edit_form(iface: &Value, ifaces: &[Value]) -> Form {
         let t = js(iface, "type");
         let name = js(iface, "iface");
         let mut fields = vec![
@@ -75,11 +88,11 @@ impl Interfaces {
         ];
         match t.as_str() {
             "bridge" | "OVSBridge" => {
-                fields.push(form::text("bridge_ports", "Bridge ports", &list_str(iface, "bridge_ports")));
+                fields.push(form::multi("bridge_ports", "Bridge ports", Self::device_opts(ifaces, &["eth", "bond", "vlan"], &name), &list_str(iface, "bridge_ports")).help("Space to select; none = internal bridge"));
                 fields.push(form::check("bridge_vlan_aware", "VLAN aware", jb(iface, "bridge_vlan_aware")));
             }
             "bond" | "OVSBond" => {
-                fields.push(form::text("slaves", "Slaves", &list_str(iface, "slaves")));
+                fields.push(form::multi("slaves", "Slaves", Self::device_opts(ifaces, &["eth"], &name), &list_str(iface, "slaves")).req(true));
                 fields.push(form::select(
                     "bond_mode",
                     "Mode",
@@ -90,7 +103,7 @@ impl Interfaces {
                 fields.push(form::select("bond_xmit_hash_policy", "Hash policy", form::opts(&["", "layer2", "layer2+3", "layer3+4"]), &js(iface, "bond_xmit_hash_policy")));
             }
             "vlan" => {
-                fields.push(form::text("vlan-raw-device", "VLAN raw device", &js(iface, "vlan-raw-device")));
+                fields.push(form::select("vlan-raw-device", "VLAN raw device", Self::device_opts(ifaces, &["eth", "bond", "bridge"], &name), &js(iface, "vlan-raw-device")));
                 fields.push(form::text("vlan-id", "VLAN tag", &js(iface, "vlan-id")));
             }
             _ => {}
@@ -106,17 +119,20 @@ impl Interfaces {
         match t {
             "bridge" => {
                 fields.push(form::text("iface", "Name", &next("vmbr")).req(true));
-                fields.push(form::text("bridge_ports", "Bridge ports", "").help("e.g. eno1 or bond0, empty for an internal bridge"));
+                fields.push(form::multi("bridge_ports", "Bridge ports", Self::device_opts(ifaces, &["eth", "bond", "vlan"], ""), "").help("Space to select; none = internal bridge"));
                 fields.push(form::check("bridge_vlan_aware", "VLAN aware", false));
             }
             "bond" => {
                 fields.push(form::text("iface", "Name", &next("bond")).req(true));
-                fields.push(form::text("slaves", "Slaves", "").req(true).help("space separated, e.g. eno1 eno2"));
+                fields.push(form::multi("slaves", "Slaves", Self::device_opts(ifaces, &["eth"], ""), "").req(true).help("Space to select the member NICs"));
                 fields.push(form::select("bond_mode", "Mode", form::opts(&["active-backup", "802.3ad", "balance-rr", "balance-xor", "broadcast", "balance-tlb", "balance-alb"]), "active-backup"));
                 fields.push(form::select("bond_xmit_hash_policy", "Hash policy", form::opts(&["", "layer2", "layer2+3", "layer3+4"]), ""));
             }
             _ => {
-                fields.push(form::text("iface", "Name", "vmbr0.100").req(true).help("<device>.<tag>, e.g. vmbr0.100"));
+                let parents = Self::device_opts(ifaces, &["eth", "bond", "bridge"], "");
+                let def = parents.iter().find(|(v, _)| v.starts_with("vmbr")).or(parents.first()).map(|(v, _)| v.clone()).unwrap_or_default();
+                fields.push(form::select("vlan_parent", "VLAN raw device", parents, &def));
+                fields.push(form::number("vlan_tag", "VLAN tag", "100").help("1-4094; the interface is named <device>.<tag>"));
             }
         }
         fields.push(form::text("cidr", "IPv4/CIDR", ""));
@@ -281,7 +297,8 @@ impl View for Interfaces {
         match key {
             'e' => {
                 if let Some(i) = self.sel() {
-                    ctx.popup(Popup::Form(Self::edit_form(i)));
+                    let all = self.data.data.as_ref().map(|d| d.ifaces.clone()).unwrap_or_default();
+                    ctx.popup(Popup::Form(Self::edit_form(i, &all)));
                 }
             }
             'n' => ctx.popup(Popup::menu("Create", "newtype", vec![item('b', "Linux Bridge"), item('o', "Linux Bond"), item('v', "Linux VLAN")])),
@@ -349,9 +366,19 @@ impl View for Interfaces {
                 ctx.api_call(format!("Update {iface}"), "PUT", format!("/nodes/{n}/network/{iface}"), params);
             }
             ["new", t] => {
+                let name = if *t == "vlan" {
+                    let tag: u32 = fv(v, "vlan_tag").parse().unwrap_or(0);
+                    if !(1..=4094).contains(&tag) || fv(v, "vlan_parent").is_empty() {
+                        ctx.popup(Popup::error("VLAN", "choose a device and a tag between 1 and 4094"));
+                        return;
+                    }
+                    format!("{}.{tag}", fv(v, "vlan_parent"))
+                } else {
+                    fv(v, "iface").to_string()
+                };
                 params.push(("type", t.to_string()));
-                params.push(("iface", fv(v, "iface").to_string()));
-                ctx.api_call(format!("Create {}", fv(v, "iface")), "POST", format!("/nodes/{n}/network"), params);
+                params.push(("iface", name.clone()));
+                ctx.api_call(format!("Create {name}"), "POST", format!("/nodes/{n}/network"), params);
             }
             _ => {}
         }

@@ -18,7 +18,7 @@ mod vnc;
 use anyhow::Result;
 use app::{App, RemoteTarget, APP_VERSION};
 use crossterm::{
-    event::{self, DisableMouseCapture, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -110,6 +110,11 @@ fn parse_args() -> Args {
 
 fn main() -> Result<()> {
     let args = parse_args();
+    if !cfg!(target_os = "linux") && args.remote.is_none() && args.ssh.is_none() && args.vnc_test.is_none() {
+        // no PVE on this machine: client modes only
+        eprintln!("pxvirt-console manages PVE nodes remotely on this system:\n  pxvirt-console --ssh root@NODE\n  pxvirt-console --remote NODE");
+        std::process::exit(2);
+    }
     let mut cfg = config::Config::load();
     if let Some(l) = args.lang {
         cfg.lang = l;
@@ -141,6 +146,12 @@ fn main() -> Result<()> {
             std::fs::write(format!("{dir}/0_login_{w}x{h}.txt"), app.debug_render(w, h))?;
         }
         app.debug_login_root()?;
+        if std::env::var("PXVIRT_MOUSE_SELFTEST").is_ok() {
+            let r = app.debug_mouse_selftest();
+            std::fs::write(format!("{dir}/mouse_selftest.txt"), &r)?;
+            print!("{r}");
+            return Ok(());
+        }
         app.debug_dump(&dir, &[(200, 50), (110, 32), (80, 25)])?;
         return Ok(());
     }
@@ -166,7 +177,7 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(backend::ConsoleBackend::new(stdout))?;
     terminal.clear()?;
 
@@ -210,6 +221,7 @@ fn run_app(terminal: &mut Term, app: &mut App) -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Event::Mouse(m) => app.on_mouse(m),
                 Event::Resize(_, _) => terminal.autoresize()?,
                 _ => {}
             }
@@ -224,6 +236,8 @@ fn run_app(terminal: &mut Term, app: &mut App) -> Result<()> {
             if let Err(e) = vnc::run_for_guest(terminal, app, req) {
                 app.ctx.toast_err(format!("console: {e:#}"));
             }
+            // the viewer turns mouse reporting off when it closes
+            execute!(io::stdout(), EnableMouseCapture)?;
             terminal.clear()?;
             app.note_activity();
         }
@@ -233,7 +247,7 @@ fn run_app(terminal: &mut Term, app: &mut App) -> Result<()> {
 /// Leave the TUI, run an interactive program (shell, guest console, apt), come back.
 fn run_suspended(terminal: &mut Term, app: &mut App, s: ctx::Suspend) -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     print!("\x1B[2J\x1B[H");
     println!("{}", s.banner);
     io::stdout().flush().ok();
@@ -258,7 +272,7 @@ fn run_suspended(terminal: &mut Term, app: &mut App, s: ctx::Suspend) -> Result<
     }
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
     if s.logout_after {
         app.logout();

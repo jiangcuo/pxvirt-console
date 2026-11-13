@@ -19,6 +19,8 @@ pub enum Kind {
     Password,
     Number,
     Select(Vec<(String, String)>),
+    /// Several choices; the value is the chosen values separated by spaces.
+    Multi(Vec<(String, String)>),
     Check,
     Info,
 }
@@ -50,6 +52,11 @@ pub fn select(key: &str, label: &str, options: Vec<(String, String)>, value: &st
     };
     Field { key: key.into(), label: label.into(), kind: Kind::Select(options), value: v, help: String::new(), required: false }
 }
+/// Multiple choice (Space toggles in the picker); value = "a b c".
+pub fn multi(key: &str, label: &str, options: Vec<(String, String)>, value: &str) -> Field {
+    Field { key: key.into(), label: label.into(), kind: Kind::Multi(options), value: value.split_whitespace().collect::<Vec<_>>().join(" "), help: String::new(), required: false }
+}
+
 pub fn check(key: &str, label: &str, on: bool) -> Field {
     Field {
         key: key.into(),
@@ -146,7 +153,10 @@ impl Form {
     }
 
     fn picker_options(&self, p: &Picker) -> Vec<(String, String)> {
-        let Kind::Select(opts) = &self.fields[p.field].kind else { return vec![] };
+        let opts = match &self.fields[p.field].kind {
+            Kind::Select(o) | Kind::Multi(o) => o,
+            _ => return vec![],
+        };
         let f = p.filter.to_lowercase();
         opts.iter()
             .filter(|(v, l)| f.is_empty() || v.to_lowercase().contains(&f) || l.to_lowercase().contains(&f))
@@ -157,6 +167,27 @@ impl Form {
     pub fn handle_key(&mut self, key: &KeyEvent) -> Outcome {
         if let Some(mut p) = self.picker.take() {
             let opts = self.picker_options(&p);
+            let is_multi = matches!(self.fields[p.field].kind, Kind::Multi(_));
+            if is_multi {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => return Outcome::None,
+                    KeyCode::Char(' ') => {
+                        if let Some((v, _)) = opts.get(p.sel) {
+                            let f = &mut self.fields[p.field];
+                            let mut chosen: Vec<String> = f.value.split_whitespace().map(|s| s.to_string()).collect();
+                            if let Some(i) = chosen.iter().position(|c| c == v) {
+                                chosen.remove(i);
+                            } else {
+                                chosen.push(v.clone());
+                            }
+                            f.value = chosen.join(" ");
+                        }
+                        self.picker = Some(p);
+                        return Outcome::None;
+                    }
+                    _ => {}
+                }
+            }
             match key.code {
                 KeyCode::Esc => return Outcome::None,
                 KeyCode::Enter => {
@@ -221,6 +252,9 @@ impl Form {
                 let sel = opts.iter().position(|(v, _)| *v == field.value).unwrap_or(0);
                 self.picker = Some(Picker { field: self.sel, filter: String::new(), sel });
             }
+            (Kind::Multi(_), KeyCode::Enter) | (Kind::Multi(_), KeyCode::Char(' ')) => {
+                self.picker = Some(Picker { field: self.sel, filter: String::new(), sel: 0 });
+            }
             (Kind::Check, KeyCode::Char(' ')) | (Kind::Check, KeyCode::Left) | (Kind::Check, KeyCode::Right) => {
                 field.value = if field.value == "1" { "0".into() } else { "1".into() };
             }
@@ -256,6 +290,13 @@ impl Form {
                     let l = opts.iter().find(|(v, _)| *v == fd.value).map(|(_, l)| l.clone()).unwrap_or(fd.value.clone());
                     format!("< {l} >")
                 }
+                Kind::Multi(_) => {
+                    if fd.value.is_empty() {
+                        format!("< ({}) >", tr("none"))
+                    } else {
+                        format!("< {} >", fd.value)
+                    }
+                }
                 _ => fd.value.clone(),
             };
             let cursor = if focused && matches!(fd.kind, Kind::Text | Kind::Password | Kind::Number) { "_" } else { "" };
@@ -288,15 +329,24 @@ impl Form {
 
         if let Some(p) = &self.picker {
             let opts = self.picker_options(p);
-            let pw = opts.iter().map(|(_, l)| super::unicode_width(l)).max().unwrap_or(20).clamp(24, 80) as u16 + 4;
+            let pw = opts.iter().map(|(_, l)| super::unicode_width(l) + 4).max().unwrap_or(20).clamp(36, 80) as u16 + 4;
             let ph = (opts.len() as u16 + 3).clamp(5, area.height.saturating_sub(4));
             let pr = centered(pw, ph, area);
             crate::ui::clear(f, pr);
             let visible = ph.saturating_sub(3) as usize;
             let start = p.sel.saturating_sub(visible.saturating_sub(1));
-            let mut pl = vec![Line::from(Span::styled(format!("/{}_", p.filter), Style::default().fg(ACCENT)))];
-            for (i, (_, l)) in opts.iter().enumerate().skip(start).take(visible) {
-                pl.push(Line::from(Span::styled(l.clone(), if i == p.sel { style_sel(true) } else { Style::default() })));
+            let multi_val = match &self.fields[p.field].kind {
+                Kind::Multi(_) => Some(self.fields[p.field].value.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>()),
+                _ => None,
+            };
+            let head = if multi_val.is_some() { format!("/{}_   Space {} · Enter {}", p.filter, tr("select"), tr("OK")) } else { format!("/{}_", p.filter) };
+            let mut pl = vec![Line::from(Span::styled(head, Style::default().fg(ACCENT)))];
+            for (i, (v, l)) in opts.iter().enumerate().skip(start).take(visible) {
+                let text = match &multi_val {
+                    Some(chosen) => format!("{} {l}", if chosen.contains(v) { "[x]" } else { "[ ]" }),
+                    None => l.clone(),
+                };
+                pl.push(Line::from(Span::styled(text, if i == p.sel { style_sel(true) } else { Style::default() })));
             }
             f.render_widget(Paragraph::new(pl).block(popup_block(&self.fields[p.field].label)), pr);
         }

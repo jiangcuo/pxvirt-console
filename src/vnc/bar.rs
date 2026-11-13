@@ -49,6 +49,7 @@ impl Act {
     }
 
     /// Untranslated label (the SDL bitmap font is ASCII only).
+    #[cfg(feature = "sdl")]
     pub fn text_en(self) -> String {
         format!(" {} ", self.label())
     }
@@ -72,6 +73,7 @@ pub const MENU_TERM: [Act; 10] = [
 ];
 
 /// Special-key menu of the SDL renderer (no image-protocol switching).
+#[cfg(feature = "sdl")]
 pub const MENU_SDL: [Act; 9] = [
     Act::CtrlAltBackspace,
     Act::CtrlAltF(1),
