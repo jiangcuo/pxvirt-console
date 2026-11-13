@@ -1,8 +1,9 @@
 //! VNC viewer inside the terminal: Kitty graphics (own zlib encoder), Sixel / iTerm2 /
 //! Unicode half blocks (ratatui-image). Keyboard and mouse are forwarded to the guest.
 //!
-//! The console never grabs a key combination: `Ctrl+Alt+Del`, special keys and closing
-//! are buttons at the bottom of the screen, clicked with the mouse.
+//! Every key goes to the guest except Ctrl+], which opens the console menu (works without
+//! a mouse: Up/Down, Enter, Esc). `Ctrl+Alt+Del`, special keys and closing are also
+//! buttons at the bottom of the screen.
 
 use anyhow::Result;
 use base64::Engine;
@@ -127,9 +128,8 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
     }
     terminal.clear()?;
 
-    // The kernel VT (TERM=linux) cannot report mouse events, so the bar would be
-    // unclickable: keep Ctrl+] as the emergency way out there only.
-    let emergency = std::env::var("TERM").map(|t| t == "linux").unwrap_or(false);
+    // keyboard selection in the menu
+    let mut sel: usize = 0;
     let interval = Duration::from_millis(1000 / fps.clamp(1, 60) as u64);
     let mut last_gen = u64::MAX;
     let mut last_draw = Instant::now() - interval;
@@ -146,13 +146,55 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
         // ---------------------------------------------------------------- input
         if event::poll(Duration::from_millis(15))? {
             match event::read()? {
-                // Every key goes to the guest: the bar is the only way to drive the console.
+                // Every key goes to the guest except Ctrl+] (console menu).
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    if emergency
-                        && k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char(']'))
-                    {
-                        break Ok(());
+                    // terminals send Ctrl+] as 0x1d, which crossterm may report as Ctrl+5
+                    if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5')) {
+                        menu = !menu;
+                        sel = 0;
+                        hover = None;
+                        if proto == Proto::Kitty {
+                            kitty_delete(&mut stdout);
+                        }
+                        dirty_layout = true;
+                        last_gen = u64::MAX;
+                        continue;
+                    }
+                    if menu {
+                        let n = bar::MENU_TERM.len();
+                        let mut run: Option<Act> = None;
+                        match k.code {
+                            KeyCode::Up => sel = (sel + n - 1) % n,
+                            KeyCode::Down => sel = (sel + 1) % n,
+                            KeyCode::Esc => menu = false,
+                            KeyCode::Enter => run = Some(bar::MENU_TERM[sel]),
+                            _ => {}
+                        }
+                        if let Some(a) = run {
+                            match a {
+                                Act::Close => break Ok(()),
+                                Act::Refresh => client.request_full(),
+                                Act::Protocol => {
+                                    proto = match proto {
+                                        Proto::Kitty => Proto::Lib(ProtocolType::Sixel),
+                                        Proto::Lib(ProtocolType::Sixel) => Proto::Lib(ProtocolType::Halfblocks),
+                                        Proto::Lib(ProtocolType::Halfblocks) => Proto::Lib(ProtocolType::Iterm2),
+                                        _ => Proto::Kitty,
+                                    };
+                                    kitty_delete(&mut stdout);
+                                    terminal.clear()?;
+                                }
+                                a => {
+                                    if let Some((mods, sym)) = bar::keysyms(a) {
+                                        client.tap(mods, sym);
+                                    }
+                                }
+                            }
+                            menu = false;
+                        }
+                        dirty_layout = true;
+                        last_gen = u64::MAX;
+                        continue;
                     }
                     if let Some((mods, sym)) = keys::from_crossterm(k.code, k.modifiers) {
                         client.tap(&mods, sym);
@@ -185,6 +227,9 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
                     }
                     if let Some(a) = act {
                         hover = Some(a);
+                        if let Some(i) = bar::MENU_TERM.iter().position(|m| *m == a).filter(|_| menu) {
+                            sel = i;
+                        }
                         if matches!(m.kind, MouseEventKind::Down(_)) {
                             match a {
                                 Act::Menu => {
@@ -299,11 +344,7 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
         };
         buttons = bar_buttons(&bar::BAR, 0, size.height.saturating_sub(1), size.width);
         let bar_end = buttons.last().map(|b| b.x + b.w).unwrap_or(0);
-        let status = if emergency {
-            format!(" {title} │ {w}x{h} │ {proto_name} │ Ctrl+] closes ")
-        } else {
-            format!(" {title} │ {w}x{h} │ {proto_name} ")
-        };
+        let status = format!(" Ctrl+] {} │ {title} │ {w}x{h} │ {proto_name} ", crate::i18n::tr("menu"));
         menu_rect = menu.then(|| centered(34, bar::MENU_TERM.len() as u16 + 2, area));
         rows = menu_rect.map(menu_rows).unwrap_or_default();
         if let Proto::Lib(p) = proto {
@@ -336,8 +377,9 @@ pub fn run(terminal: &mut Term, client: &mut Client, title: &str, fps: u32) -> R
                 crate::ui::clear(f, r);
                 let lines: Vec<Line> = rows_ref
                     .iter()
-                    .map(|b| {
-                        let st = if hover == Some(b.act) {
+                    .enumerate()
+                    .map(|(i, b)| {
+                        let st = if i == sel {
                             Style::default().bg(Color::White).fg(Color::Blue).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)

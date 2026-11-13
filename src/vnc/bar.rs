@@ -1,8 +1,10 @@
 //! Clickable action strip shown at the bottom of the graphical console.
 //!
-//! The console never steals a keyboard combination: every key goes to the guest.
-//! Actions (Ctrl+Alt+Del, special keys, close...) are triggered with the mouse on
-//! the bar or its menu, so the pointer over those areas is not forwarded either.
+//! Every key goes to the guest except one reserved combination that opens the
+//! console menu (SDL: Ctrl+Alt+Shift+Q, terminal: Ctrl+]). Actions (Ctrl+Alt+Del,
+//! special keys, close...) are buttons on the bar or entries of that menu, usable
+//! with the mouse or, in the menu, with the keyboard. The pointer over the bar and
+//! the menu is not forwarded to the guest.
 
 use crate::i18n::tr;
 
@@ -44,6 +46,11 @@ impl Act {
     /// Label with the padding the bar draws around it.
     pub fn text(self) -> String {
         format!(" {} ", tr(self.label()))
+    }
+
+    /// Untranslated label (the SDL bitmap font is ASCII only).
+    pub fn text_en(self) -> String {
+        format!(" {} ", self.label())
     }
 }
 

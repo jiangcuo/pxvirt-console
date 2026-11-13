@@ -1,9 +1,9 @@
 //! Full-screen VNC viewer with SDL2. On the physical console (no X/Wayland) SDL uses
 //! KMSDRM and reads the keyboard/mouse through evdev.
 //!
-//! The console never grabs a key combination: every key goes to the guest. Actions
-//! (Ctrl+Alt+Del, special keys, close) are buttons on a status bar drawn at the bottom
-//! of the screen (and in a pop-up menu), clicked with the mouse.
+//! Every key goes to the guest except Ctrl+Alt+Shift+Q, which opens the console menu
+//! (works without a mouse: Up/Down, Enter, Esc). Actions (Ctrl+Alt+Del, special keys,
+//! close) are also buttons on the status bar at the bottom of the screen.
 
 use anyhow::{anyhow, Result};
 use sdl2::event::{Event, WindowEvent};
@@ -21,29 +21,6 @@ use super::rfb::{snapshot_rgb, Client};
 const BAR_H: u32 = 24;
 const SCALE: u32 = 2;
 
-/// True if the kernel exposes a pointer (relative mouse or absolute touch device).
-/// Without one the status bar cannot be clicked, so the emergency exit chord stays.
-fn has_mouse() -> bool {
-    let Ok(dir) = std::fs::read_dir("/sys/class/input") else { return true };
-    for e in dir.flatten() {
-        if !e.file_name().to_string_lossy().starts_with("event") {
-            continue;
-        }
-        let caps = e.path().join("device/capabilities");
-        for file in ["rel", "abs"] {
-            let Ok(s) = std::fs::read_to_string(caps.join(file)) else { continue };
-            // hex words, most significant first
-            let mut words: Vec<u64> = s.split_whitespace().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect();
-            words.reverse();
-            // REL_X/REL_Y or ABS_X/ABS_Y
-            if words.first().copied().unwrap_or(0) & 0b11 == 0b11 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 pub fn on_physical_console() -> bool {
     std::env::var("SSH_CONNECTION").is_err()
         && std::env::var("DISPLAY").is_err()
@@ -57,6 +34,32 @@ fn fit(out: (u32, u32), fb: (u32, u32)) -> (Rect, f64) {
     let w = (fb.0 as f64 * s) as u32;
     let h = (fb.1 as f64 * s) as u32;
     (Rect::new(((out.0 - w) / 2) as i32, ((out.1 - h) / 2) as i32, w.max(1), h.max(1)), s)
+}
+
+/// The reserved combination that opens the console menu.
+const MENU_HINT: &str = "Ctrl+Alt+Shift+Q: menu";
+
+fn is_menu_chord(k: Keycode, m: Mod) -> bool {
+    k == Keycode::Q
+        && m.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
+        && m.intersects(Mod::LALTMOD | Mod::RALTMOD)
+        && m.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD)
+}
+
+/// Small arrow drawn where the mouse is while it is over the bar or the menu
+/// (the guest draws its own pointer only inside the picture).
+fn draw_cursor(c: &mut sdl2::render::Canvas<sdl2::video::Window>, x: i32, y: i32) {
+    const ARROW: [u16; 12] = [0b1, 0b11, 0b111, 0b1111, 0b11111, 0b111111, 0b1111111, 0b11111111, 0b111111, 0b100111, 0b11, 0b11];
+    let mut rects = Vec::new();
+    for (row, bits) in ARROW.iter().enumerate() {
+        for col in 0..10 {
+            if bits & (1 << col) != 0 {
+                rects.push(Rect::new(x + col * 2, y + row as i32 * 2, 2, 2));
+            }
+        }
+    }
+    let _ = c.set_draw_color(Color::RGB(255, 255, 255));
+    let _ = c.fill_rects(&rects);
 }
 
 fn text_width(s: &str) -> u32 {
@@ -94,7 +97,7 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
         let f = client.fb.lock().unwrap();
         (f.w as u32, f.h as u32)
     };
-    let mut wb = video.window(&format!("{title} - click Close on the status bar"), fw.max(640), fh.max(480));
+    let mut wb = video.window(&format!("{title} - {MENU_HINT}"), fw.max(640), fh.max(480));
     if windowed {
         wb.resizable();
     } else {
@@ -122,8 +125,10 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
     let mut menu = false;
     let mut hover: Option<Act> = None;
     let mut dirty = true;
-    // No pointer on this machine: keep Ctrl+Alt+Q as the only way out.
-    let no_mouse = !has_mouse();
+    // keyboard selection in the menu
+    let mut sel: usize = 0;
+    // last mouse position (for the local cursor over the bar / menu)
+    let mut mouse: Option<(i32, i32)> = None;
 
     loop {
         let out = canvas.output_size().map_err(|e| anyhow!("{e}"))?;
@@ -132,15 +137,48 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
             match ev {
                 Event::Quit { .. } => return Ok(()),
                 Event::KeyDown { keycode: Some(k), keymod, .. } => {
-                    if no_mouse && k == Keycode::Q && keymod.contains(Mod::LCTRLMOD | Mod::LALTMOD) {
-                        return Ok(());
+                    if is_menu_chord(k, keymod) {
+                        // the modifiers already went down in the guest: release them
+                        for m in [keys::CONTROL_L, 0xffe4, keys::ALT_L, 0xffea, keys::SHIFT_L, 0xffe2] {
+                            client.key(false, m);
+                        }
+                        menu = !menu;
+                        sel = 0;
+                        dirty = true;
+                        continue;
                     }
-                    // Everything else is forwarded; no combination is reserved for the console.
+                    if menu {
+                        let n = bar::MENU_SDL.len();
+                        match k {
+                            Keycode::UP => sel = (sel + n - 1) % n,
+                            Keycode::DOWN => sel = (sel + 1) % n,
+                            Keycode::ESCAPE => menu = false,
+                            Keycode::RETURN | Keycode::KP_ENTER => match bar::MENU_SDL[sel] {
+                                Act::Refresh => {
+                                    client.request_full();
+                                    menu = false;
+                                }
+                                Act::Close => return Ok(()),
+                                a => {
+                                    if let Some((mods, sym)) = bar::keysyms(a) {
+                                        client.tap(mods, sym);
+                                    }
+                                    menu = false;
+                                }
+                            },
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    }
                     if let Some(sym) = keys::from_sdl(k) {
                         client.key(true, sym);
                     }
                 }
                 Event::KeyUp { keycode: Some(k), .. } => {
+                    if menu {
+                        continue;
+                    }
                     if let Some(sym) = keys::from_sdl(k) {
                         client.key(false, sym);
                     }
@@ -150,6 +188,15 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
                         .or_else(|| bar::hit(&bar_buttons, x.max(0) as u16, y.max(0) as u16));
                     if act != hover {
                         hover = act;
+                        if let Some(i) = act.and_then(|a| bar::MENU_SDL.iter().position(|m| *m == a)).filter(|_| menu) {
+                            sel = i;
+                        }
+                        dirty = true;
+                    }
+                    let ours = act.is_some() || menu || (y >= 0 && y as u32 >= bar_top);
+                    let prev = mouse;
+                    mouse = ours.then_some((x, y));
+                    if mouse != prev {
                         dirty = true;
                     }
                     // the status bar and the menu are ours: never move the guest pointer under them
@@ -251,7 +298,7 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
             let mut bb = Vec::new();
             let mut x = 4i32;
             for a in &bar::BAR {
-                let label = a.text();
+                let label = a.text_en();
                 let w = text_width(&label);
                 if x + w as i32 > out.0 as i32 {
                     break;
@@ -270,14 +317,10 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
                     let _ = canvas.fill_rect(sdl_rect(*b));
                 }
                 let fg = if sel { Color::RGB(0, 0, 128) } else { Color::RGB(255, 255, 255) };
-                draw_text(&mut canvas, b.x as i32, b.y as i32 + 4, &b.act.text(), fg);
+                draw_text(&mut canvas, b.x as i32, b.y as i32 + 4, &b.act.text_en(), fg);
             }
             if used + 8 < out.0 {
-                let info = if no_mouse {
-                    format!("{title}  {w}x{h}  no mouse: Ctrl+Alt+Q closes")
-                } else {
-                    format!("{title}  {w}x{h}")
-                };
+                let info = format!("{MENU_HINT}   {title}  {w}x{h}");
                 let avail = (out.0 - used - 8) / (8 * SCALE);
                 let s: String = info.chars().take(avail as usize).collect();
                 draw_text(&mut canvas, (used + 8) as i32, bar_top as i32 + 4, &s, Color::RGB(200, 200, 200));
@@ -295,13 +338,17 @@ pub fn run(client: &mut Client, title: &str) -> Result<()> {
                 for (i, a) in bar::MENU_SDL.iter().enumerate() {
                     let br = Button::new(*a, (x + 8) as u16, (y + 4 + (i as u32 * BAR_H) as i32) as u16, w as u16 - 16, BAR_H as u16);
                     menu_rows.push(br);
-                    if hover == Some(*a) {
+                    let on = i == sel;
+                    if on {
                         let _ = canvas.set_draw_color(Color::RGB(255, 255, 255));
                         let _ = canvas.fill_rect(sdl_rect(br));
                     }
-                    let fg = if hover == Some(*a) { Color::RGB(0, 0, 0) } else { Color::RGB(255, 255, 255) };
-                    draw_text(&mut canvas, br.x as i32, br.y as i32 + 4, &a.text(), fg);
+                    let fg = if on { Color::RGB(0, 0, 0) } else { Color::RGB(255, 255, 255) };
+                    draw_text(&mut canvas, br.x as i32, br.y as i32 + 4, &a.text_en(), fg);
                 }
+            }
+            if let Some((mx, my)) = mouse {
+                draw_cursor(&mut canvas, mx, my);
             }
             canvas.present();
         }
