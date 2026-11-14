@@ -372,6 +372,18 @@ impl App {
                     dump(self, &format!("{name}_menu"))?;
                     self.popups.clear();
                 }
+                // upload file browser of the first storage
+                if self.modules[m].views[v].title() == "Storage" && self.modules[m].views[v].table().map(|t| t.selected().is_some()).unwrap_or(false) {
+                    use crossterm::event::{KeyCode, KeyEvent};
+                    self.on_key(KeyEvent::from(KeyCode::Char('U')));
+                    settle(self, 300);
+                    dump(self, &format!("{name}_upload"))?;
+                    self.open_context_menu();
+                    dump(self, &format!("{name}_upload_menu"))?;
+                    self.popups.clear();
+                    self.on_key(KeyEvent::from(KeyCode::Esc));
+                    settle(self, 300);
+                }
                 // guest configuration page of the first guest: page, menu, add menu, first edit form
                 if self.modules[m].views[v].title() == "Guests" && self.modules[m].views[v].table().map(|t| t.selected().is_some()).unwrap_or(false) {
                     use crossterm::event::{KeyCode, KeyEvent};

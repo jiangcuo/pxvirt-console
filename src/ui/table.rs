@@ -71,6 +71,11 @@ impl Table {
         self.keys.get(self.sel).map(|s| s.as_str())
     }
 
+    /// Select the row with this key at the next draw.
+    pub fn select_key(&mut self, key: &str) {
+        self.sel_key = Some(key.to_string());
+    }
+
     /// Marked keys, or the selected one when nothing is marked.
     pub fn targets(&self) -> Vec<String> {
         if !self.marked.is_empty() {

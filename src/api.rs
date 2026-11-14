@@ -13,6 +13,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -358,37 +359,123 @@ impl Api {
                         }
                         serde_json::from_str(&text).context("invalid JSON from API")
                     }
-                    Err(ureq::Error::Status(code, r)) => {
-                        let reason = r.status_text().to_string();
-                        let body = r.into_string().unwrap_or_default();
-                        let errors = serde_json::from_str::<Value>(&body)
-                            .ok()
-                            .and_then(|v| v.get("errors").cloned())
-                            .map(|e| match e {
-                                Value::Object(m) => m
-                                    .iter()
-                                    .map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or(&v.to_string()).trim()))
-                                    .collect::<Vec<_>>()
-                                    .join("; "),
-                                other => other.to_string(),
-                            })
-                            .unwrap_or_default();
-                        if errors.is_empty() {
-                            bail!("{code} {reason}")
-                        } else {
-                            bail!("{code} {reason} ({errors})")
-                        }
-                    }
-                    Err(e) => Err(anyhow!("connection failed: {e}")),
+                    Err(e) => Err(http_error(e)),
                 }
             }
             Transport::Pvesh => pvesh(method, path, params),
         }
     }
 
+    /// Upload a file as multipart/form-data, streamed from disk (ISO images are several GB).
+    /// `fields` come first, the file part is named `filename` (like the PVE web UI).
+    pub fn upload(&self, path: &str, fields: &[(&str, String)], file: &std::path::Path, name: &str, prog: Arc<UploadProgress>) -> Result<Value> {
+        use std::io::{Cursor, Read};
+        let Transport::Http { base, auth, .. } = &self.transport else {
+            bail!("uploads need the PVE API (not available in rescue mode)");
+        };
+        let size = std::fs::metadata(file).with_context(|| format!("{}", file.display()))?.len();
+        let fh = std::fs::File::open(file).with_context(|| format!("{}", file.display()))?;
+        let boundary = format!("----pxvirt{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        // pveproxy extracts the fields in this fixed order before the file part
+        let order = |k: &str| ["content", "checksum-algorithm", "checksum"].iter().position(|x| *x == k).unwrap_or(9);
+        let mut fields = fields.to_vec();
+        fields.sort_by_key(|(k, _)| order(k));
+        let (head, tail) = multipart_frame(&boundary, &fields, name);
+        prog.total.store(size, Ordering::Relaxed);
+        let len = head.len() as u64 + size + tail.len() as u64;
+        let body = Cursor::new(head).chain(ProgressReader { inner: fh, prog: prog.clone() }).chain(Cursor::new(tail));
+        // own agent: no overall timeout, the transfer may take long
+        let agent = ureq::AgentBuilder::new()
+            .tls_config(self.tls.clone())
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_write(Duration::from_secs(120))
+            .timeout_read(Duration::from_secs(900))
+            .build();
+        let mut req = agent
+            .post(&format!("{base}{path}"))
+            .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+            .set("Content-Length", &len.to_string());
+        if let Some(a) = auth.lock().unwrap().as_ref() {
+            req = req.set("Cookie", &format!("PVEAuthCookie={}", a.ticket)).set("CSRFPreventionToken", &a.csrf);
+        }
+        match req.send(body) {
+            Ok(r) => {
+                let text = r.into_string().context("reading response")?;
+                let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                Ok(v.get("data").cloned().unwrap_or(Value::Null))
+            }
+            Err(_) if prog.cancel.load(Ordering::Relaxed) => bail!("upload cancelled"),
+            Err(e) => Err(http_error(e)),
+        }
+    }
+
     pub fn base_url(&self) -> String {
         format!("https://{}:{}", host_for_url(&self.host), self.port)
     }
+}
+
+fn http_error(e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(code, r) => {
+            let reason = r.status_text().to_string();
+            let body = r.into_string().unwrap_or_default();
+            let errors = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("errors").cloned())
+                .map(|e| match e {
+                    Value::Object(m) => m
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or(&v.to_string()).trim()))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            if errors.is_empty() {
+                anyhow!("{code} {reason}")
+            } else {
+                anyhow!("{code} {reason} ({errors})")
+            }
+        }
+        e => anyhow!("connection failed: {e}"),
+    }
+}
+
+/// Progress of a running upload, shared with the UI.
+#[derive(Default)]
+pub struct UploadProgress {
+    pub sent: AtomicU64,
+    pub total: AtomicU64,
+    pub cancel: AtomicBool,
+}
+
+struct ProgressReader<R> {
+    inner: R,
+    prog: Arc<UploadProgress>,
+}
+
+impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.prog.cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("upload cancelled"));
+        }
+        let n = self.inner.read(buf)?;
+        self.prog.sent.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Multipart body around the file data: (fields + file part header, closing boundary).
+fn multipart_frame(boundary: &str, fields: &[(&str, String)], name: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut head = String::new();
+    for (k, v) in fields {
+        head.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"));
+    }
+    let safe = name.replace(['"', '\r', '\n'], "_");
+    head.push_str(&format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"filename\"; filename=\"{safe}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    ));
+    (head.into_bytes(), format!("\r\n--{boundary}--\r\n").into_bytes())
 }
 
 fn pvesh(method: &str, path: &str, params: &[(&str, String)]) -> Result<Value> {
@@ -474,5 +561,112 @@ mod tests {
     #[test]
     fn decode() {
         assert_eq!(urldecode("a%2Fb+c"), "a/b c");
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn multipart_body_layout() {
+        let (h, t) = multipart_frame("B", &[("content", "iso".into())], "a\"b.iso");
+        let mut body = String::from_utf8(h).unwrap();
+        body.push_str("DATA");
+        body.push_str(&String::from_utf8(t).unwrap());
+        assert_eq!(
+            body,
+            "--B\r\nContent-Disposition: form-data; name=\"content\"\r\n\r\niso\r\n--B\r\nContent-Disposition: form-data; name=\"filename\"; filename=\"a_b.iso\"\r\nContent-Type: application/octet-stream\r\n\r\nDATA\r\n--B--\r\n"
+        );
+    }
+
+    /// Real PVE: `sudo UP_LIVE=storage UP_NODE=node test-binary live_upload --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_upload() {
+        let (Ok(storage), Ok(node)) = (std::env::var("UP_LIVE"), std::env::var("UP_NODE")) else { return };
+        let api = Api::local();
+        api.set_auth(forge_root_auth().expect("root ticket"));
+        let dir = std::env::temp_dir().join(format!("pxup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.iso");
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let data: Vec<u8> = (0..40 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        std::fs::write(&file, &data).unwrap();
+        let sha = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let path = format!("/nodes/{node}/storage/{storage}/upload");
+        let wait = |upid: &str| -> String {
+            loop {
+                let st = api.get(&format!("/nodes/{node}/tasks/{}/status", urlenc(upid))).unwrap();
+                if crate::util::js(&st, "status") == "stopped" {
+                    return crate::util::js(&st, "exitstatus");
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        };
+        let content = || crate::util::jarr(&api.get(&format!("/nodes/{node}/storage/{storage}/content?content=iso")).unwrap()).iter().map(|c| crate::util::js(c, "volid")).collect::<Vec<_>>();
+        let vol = |n: &str| format!("{storage}:iso/{n}");
+
+        // 1. upload with the right checksum
+        let prog = Arc::new(UploadProgress::default());
+        let t = Instant::now();
+        let fields = [("content", "iso".to_string()), ("checksum", sha.clone()), ("checksum-algorithm", "sha256".to_string())];
+        let v = api.upload(&path, &fields, &file, "pxvirt-upload-test.iso", prog.clone()).expect("upload");
+        let upid = is_upid(&v).expect("UPID");
+        let exit = wait(&upid);
+        println!("ok upload: {} bytes in {:.1}s, task {exit}", prog.sent.load(Ordering::Relaxed), t.elapsed().as_secs_f64());
+        assert_eq!(exit, "OK");
+        assert_eq!(prog.sent.load(Ordering::Relaxed), data.len() as u64);
+        assert!(content().contains(&vol("pxvirt-upload-test.iso")));
+
+        // 2. wrong checksum: rejected, nothing left behind
+        let bad = [("content", "iso".to_string()), ("checksum", "0".repeat(64)), ("checksum-algorithm", "sha256".to_string())];
+        let r = api.upload(&path, &bad, &file, "pxvirt-upload-bad.iso", Arc::new(UploadProgress::default()));
+        let res = match r {
+            Ok(v) => wait(&is_upid(&v).expect("UPID")),
+            Err(e) => format!("{e:#}"),
+        };
+        println!("ok bad checksum -> {res}");
+        assert_ne!(res, "OK");
+        assert!(!content().contains(&vol("pxvirt-upload-bad.iso")));
+
+        // 3. cancel halfway
+        let prog = Arc::new(UploadProgress::default());
+        let p2 = prog.clone();
+        std::thread::spawn(move || {
+            while p2.sent.load(Ordering::Relaxed) < 8 << 20 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            p2.cancel.store(true, Ordering::Relaxed);
+        });
+        let r = api.upload(&path, &[("content", "iso".to_string())], &file, "pxvirt-upload-cancel.iso", prog.clone());
+        println!("ok cancel at {} bytes -> {:?}", prog.sent.load(Ordering::Relaxed), r.as_ref().err().map(|e| e.to_string()));
+        assert!(r.is_err());
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!content().contains(&vol("pxvirt-upload-cancel.iso")));
+
+        // cleanup
+        api.delete(&format!("/nodes/{node}/storage/{storage}/content/{}", urlenc(&vol("pxvirt-upload-test.iso"))), &[]).expect("delete");
+        assert!(!content().contains(&vol("pxvirt-upload-test.iso")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_reader_counts_and_cancels() {
+        let prog = Arc::new(UploadProgress::default());
+        let mut r = ProgressReader { inner: std::io::Cursor::new(vec![0u8; 1000]), prog: prog.clone() };
+        let mut buf = [0u8; 300];
+        assert_eq!(r.read(&mut buf).unwrap(), 300);
+        assert_eq!(prog.sent.load(Ordering::Relaxed), 300);
+        prog.cancel.store(true, Ordering::Relaxed);
+        assert!(r.read(&mut buf).is_err());
     }
 }

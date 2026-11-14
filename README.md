@@ -16,7 +16,7 @@ your workstation to manage a remote node over SSH or the PVE API.
   live traffic, tools (ping, traceroute, …), routes, firewall
 - **Disks**: disks, partitions, LVM, ZFS, Ceph
 - **Services & Logs**: systemd services, journal, PVE tasks
-- **PVE**: VMs and containers (start/stop/create), storage browser (download ISOs and templates from a URL), cluster nodes
+- **PVE**: VMs and containers (start/stop/create, full hardware and options editor), storage browser (upload ISOs, templates and OVAs from your computer, or let the node download them from a URL), cluster nodes
 - **Graphical VM console**: VNC rendered with SDL2/KMSDRM on tty1, or as Kitty/Sixel/half-block graphics in a terminal, with mouse support
 - PVE login (TFA supported) and per-user permissions. Actions the user is not allowed to run are hidden
 - Keyboard-first (F1–F5 modules, 1–9 pages, action keys shown in the action bar), mouse supported

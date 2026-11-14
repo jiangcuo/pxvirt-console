@@ -1141,6 +1141,111 @@ struct Storage {
     ctable: Table,
     templates: Option<Job<Vec<Value>>>,
     tmpl_list: Vec<Value>,
+    /// local file browser for uploads (files of the machine running the console)
+    picker: Option<FileBrowser>,
+    last_dir: Option<std::path::PathBuf>,
+    upload_file: Option<std::path::PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Upload file browser
+// ---------------------------------------------------------------------------
+
+struct FsEntry {
+    name: String,
+    path: std::path::PathBuf,
+    dir: bool,
+    size: u64,
+    mtime: i64,
+}
+
+struct FileBrowser {
+    storage: String,
+    /// content types the storage accepts (iso / vztmpl / import)
+    allowed: Vec<&'static str>,
+    dir: std::path::PathBuf,
+    entries: Vec<FsEntry>,
+    table: Table,
+    error: Option<String>,
+    hidden: bool,
+    all: bool,
+}
+
+/// Upload content type of a file name.
+fn upload_content(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    if n.ends_with(".iso") || n.ends_with(".img") {
+        Some("iso")
+    } else if [".tar.gz", ".tar.xz", ".tar.zst", ".tgz"].iter().any(|e| n.ends_with(e)) {
+        Some("vztmpl")
+    } else if [".ova", ".qcow2", ".vmdk", ".raw"].iter().any(|e| n.ends_with(e)) {
+        Some("import")
+    } else {
+        None
+    }
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME").map(std::path::PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| "/".into())
+}
+
+impl FileBrowser {
+    fn new(storage: &str, allowed: Vec<&'static str>, dir: std::path::PathBuf) -> Self {
+        let mut b = Self { storage: storage.into(), allowed, dir, entries: vec![], table: Table::default(), error: None, hidden: false, all: false };
+        b.read();
+        b
+    }
+
+    fn read(&mut self) {
+        self.entries.clear();
+        self.error = None;
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(format!("{}: {e}", self.dir.display()));
+                return;
+            }
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && !self.hidden {
+                continue;
+            }
+            let path = e.path();
+            // follow symlinks (e.g. /media links)
+            let Ok(md) = std::fs::metadata(&path) else { continue };
+            let dir = md.is_dir();
+            if !dir && !self.all && !upload_content(&name).map(|c| self.allowed.contains(&c)).unwrap_or(false) {
+                continue;
+            }
+            let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+            self.entries.push(FsEntry { name, path, dir, size: md.len(), mtime });
+        }
+        self.entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        self.table = Table::default();
+    }
+
+    fn cd(&mut self, dir: std::path::PathBuf) {
+        self.dir = dir;
+        self.read();
+    }
+
+    fn up(&mut self) {
+        if let Some(p) = self.dir.parent().map(|p| p.to_path_buf()) {
+            let from = self.dir.file_name().map(|n| n.to_string_lossy().to_string());
+            self.cd(p);
+            // keep the directory we came from selected
+            if let Some(f) = from {
+                self.table.select_key(&format!("f:{f}"));
+            }
+        }
+    }
+
+    fn selected(&self) -> Option<&FsEntry> {
+        let k = self.table.selected()?;
+        let name = k.strip_prefix("f:")?;
+        self.entries.iter().find(|e| e.name == name)
+    }
 }
 
 impl Storage {
@@ -1165,6 +1270,56 @@ impl Storage {
 impl Storage {
     fn storage_content(&self, name: &str) -> String {
         self.data.data.as_ref().and_then(|d| d.iter().find(|s| js(s, "storage") == name)).map(|s| js(s, "content")).unwrap_or_default()
+    }
+
+    /// Content types a storage accepts for uploads.
+    fn upload_types(&self, storage: &str) -> Vec<&'static str> {
+        let c = self.storage_content(storage);
+        ["iso", "vztmpl", "import"].into_iter().filter(|t| c.split(',').any(|x| x == *t)).collect()
+    }
+
+    fn open_picker(&mut self, storage: &str) {
+        let dir = self.last_dir.clone().filter(|d| d.is_dir()).unwrap_or_else(home_dir);
+        self.picker = Some(FileBrowser::new(storage, self.upload_types(storage), dir));
+    }
+
+    fn upload_menu_item(&self, ctx: &Ctx, storage: &str) -> MenuItem {
+        item('U', "Upload file")
+            .require(ctx.need_priv(&format!("/storage/{storage}"), "Datastore.AllocateTemplate"))
+            .disabled_if(self.upload_types(storage).is_empty(), "no 'iso' / 'vztmpl' / 'import' content")
+            .disabled_if(ctx.api.is_pvesh(), "not available in rescue mode")
+    }
+
+    fn upload_form(&mut self, storage: &str, path: &std::path::Path) -> Form {
+        self.upload_file = Some(path.to_path_buf());
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let types: Vec<(String, String)> = self
+            .upload_types(storage)
+            .into_iter()
+            .map(|t| {
+                let label = match t {
+                    "iso" => "ISO image",
+                    "vztmpl" => "CT template",
+                    _ => "Import (OVA / disk image)",
+                };
+                (t.to_string(), label.to_string())
+            })
+            .collect();
+        let detected = upload_content(&name).unwrap_or("iso");
+        Form::new(
+            "Upload file",
+            &format!("upload:{storage}"),
+            vec![
+                form::info("File", &path.display().to_string()),
+                form::info("Size", &fmt_bytes(size as f64)),
+                form::info("Storage", storage),
+                form::select("content", "Type", types, detected),
+                form::text("filename", "File name", &name).req(true),
+                form::select("algorithm", "Checksum", form::opts(&["none", "sha256", "sha512", "sha1", "md5", "sha224", "sha384"]), "none"),
+                form::text("checksum", "Checksum value", "").help("PVE verifies the file after the upload"),
+            ],
+        )
     }
 
     /// Download-from-URL form (PVE downloads on the node itself, the console only starts it).
@@ -1257,6 +1412,9 @@ impl View for Storage {
     }
 
     fn table(&mut self) -> Option<&mut Table> {
+        if let Some(p) = &mut self.picker {
+            return Some(&mut p.table);
+        }
         if self.browsing.is_some() {
             Some(&mut self.ctable)
         } else {
@@ -1265,6 +1423,9 @@ impl View for Storage {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.picker.is_some() {
+            return vec![("Esc", "back"), ("Enter", "open"), ("Backspace", "parent"), ("~", "home"), (".", "hidden"), ("*", "all files")];
+        }
         if self.browsing.is_some() {
             vec![("Esc", "back")]
         } else {
@@ -1273,6 +1434,37 @@ impl View for Storage {
     }
 
     fn on_key(&mut self, key: &KeyEvent, ctx: &mut Ctx) -> bool {
+        if let Some(p) = &mut self.picker {
+            match key.code {
+                KeyCode::Esc => {
+                    self.last_dir = Some(p.dir.clone());
+                    self.picker = None;
+                }
+                KeyCode::Enter => match p.selected().map(|e| (e.dir, e.path.clone())) {
+                    Some((true, path)) => p.cd(path),
+                    Some((false, path)) => {
+                        let s = p.storage.clone();
+                        self.last_dir = Some(p.dir.clone());
+                        let f = self.upload_form(&s, &path);
+                        ctx.popup(Popup::Form(f));
+                    }
+                    None if p.table.selected() == Some("..") => p.up(),
+                    None => {}
+                },
+                KeyCode::Backspace | KeyCode::Left => p.up(),
+                KeyCode::Char('~') => p.cd(home_dir()),
+                KeyCode::Char('.') => {
+                    p.hidden = !p.hidden;
+                    p.read();
+                }
+                KeyCode::Char('*') => {
+                    p.all = !p.all;
+                    p.read();
+                }
+                _ => return false,
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Esc if self.browsing.is_some() => {
                 self.browsing = None;
@@ -1293,6 +1485,28 @@ impl View for Storage {
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect, _ctx: &Ctx, focused: bool) {
+        if let Some(p) = &mut self.picker {
+            let mut rows = Vec::new();
+            if p.dir.parent().is_some() {
+                rows.push(Row::new("..").cs("..", Style::default().fg(ACCENT)).c("").c("").c(""));
+            }
+            for e in &p.entries {
+                rows.push(if e.dir {
+                    Row::new(format!("f:{}", e.name)).cs(format!("{}/", e.name), Style::default().fg(ACCENT)).c("").c(if e.mtime > 0 { fmt_time(e.mtime) } else { String::new() }).c("")
+                } else {
+                    Row::new(format!("f:{}", e.name))
+                        .c(e.name.clone())
+                        .c(fmt_bytes(e.size as f64))
+                        .c(if e.mtime > 0 { fmt_time(e.mtime) } else { String::new() })
+                        .cs(upload_content(&e.name).unwrap_or("-"), style_dim())
+                });
+            }
+            let cols = [col("Name", Constraint::Min(20)), col("Size", Constraint::Length(9)), col("Modified", Constraint::Length(19)), col("Type", Constraint::Length(7))];
+            let title = format!("{} → {}: {}  (Esc = {})", tr("Upload file"), p.storage, p.dir.display(), tr("back"));
+            let status = p.error.clone().map(|e| (e, style_bad()));
+            p.table.draw(f, area, &title, &cols, &rows, focused, status);
+            return;
+        }
         if let Some(s) = &self.browsing {
             let rows: Vec<Row> = self
                 .content
@@ -1355,8 +1569,26 @@ impl View for Storage {
         self.table.draw(f, area, "Storage", &cols, &rows, focused, loading_or_error(&self.data.error, self.data.loading()));
     }
 
-    fn draw_detail(&mut self, f: &mut Frame, area: Rect, _ctx: &Ctx, focused: bool) {
+    fn draw_detail(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx, focused: bool) {
         let mut kv = Kv::new();
+        if let Some(p) = &self.picker {
+            let host = crate::util::local_hostname();
+            kv.add("Files on", if ctx.this_machine() { format!("{host} ({})", tr("this node")) } else { format!("{host} ({})", tr("this computer")) });
+            kv.add("Upload to", format!("{} @ {}", p.storage, ctx.node));
+            kv.add("Accepts", p.allowed.join(", "));
+            if let Some(e) = p.selected() {
+                kv.blank();
+                kv.add("Name", e.name.clone());
+                if !e.dir {
+                    kv.add("Size", fmt_bytes(e.size as f64));
+                    kv.add("Type", upload_content(&e.name).unwrap_or("-"));
+                }
+            }
+            kv.blank();
+            kv.styled("", tr("The node first stores the upload in /var/tmp: it needs free space there."), style_dim());
+            draw_lines(f, area, "Details", focused, kv.lines(), 0);
+            return;
+        }
         if self.browsing.is_some() {
             if let Some(c) = self.ctable.selected().and_then(|k| self.content.data.as_ref()?.iter().find(|c| js(c, "volid") == k)) {
                 if let Value::Object(m) = c {
@@ -1380,12 +1612,22 @@ impl View for Storage {
     }
 
     fn menu(&self, ctx: &Ctx) -> Vec<MenuItem> {
+        if let Some(p) = &self.picker {
+            let file = p.selected().map(|e| !e.dir).unwrap_or(false);
+            return vec![
+                item('U', "Upload this file").disabled_if(!file, "select a file"),
+                item('p', "Go to path"),
+                item('.', if p.hidden { "Hide hidden files" } else { "Show hidden files" }),
+                item('*', if p.all { "Only uploadable files" } else { "Show all files" }),
+            ];
+        }
         if let Some(s) = &self.browsing {
             let path = format!("/storage/{s}");
             let sel = self.ctable.selected().is_some();
             let content = self.storage_content(s);
             let tmpl = ctx.need_priv(&path, "Datastore.AllocateTemplate");
             return vec![
+                self.upload_menu_item(ctx, s),
                 item('w', "Download from URL").require(tmpl.clone()).disabled_if(!content.contains("iso") && !content.contains("vztmpl"), "no 'iso' / 'vztmpl' content"),
                 item('T', "Download CT template").require(tmpl).disabled_if(!content.contains("vztmpl"), "no 'vztmpl' content"),
                 item('x', "Delete volume").require(ctx.need_priv(&path, "Datastore.Allocate")).disabled_if(!sel, "nothing selected"),
@@ -1397,6 +1639,7 @@ impl View for Storage {
         let en = jb(s, "enabled");
         vec![
             item('b', "Browse content"),
+            self.upload_menu_item(ctx, &js(s, "storage")),
             item('w', "Download from URL").require(ctx.need_priv(&path, "Datastore.AllocateTemplate")).disabled_if(!content.contains("iso") && !content.contains("vztmpl"), "no 'iso' / 'vztmpl' content"),
             item('T', "Download CT template").require(ctx.need_priv(&path, "Datastore.AllocateTemplate")).disabled_if(!content.contains("vztmpl"), "no 'vztmpl' content"),
             item(if en { 'E' } else { 'e' }, if en { "Disable storage" } else { "Enable storage" }).require(ctx.need_priv(&path, "Datastore.Allocate")),
@@ -1404,6 +1647,36 @@ impl View for Storage {
     }
 
     fn on_menu(&mut self, _tag: &str, key: char, ctx: &mut Ctx) {
+        if let Some(p) = &mut self.picker {
+            match key {
+                'U' => {
+                    if let Some(path) = p.selected().filter(|e| !e.dir).map(|e| e.path.clone()) {
+                        let s = p.storage.clone();
+                        self.last_dir = Some(p.dir.clone());
+                        let f = self.upload_form(&s, &path);
+                        ctx.popup(Popup::Form(f));
+                    }
+                }
+                'p' => ctx.popup(Popup::Form(Form::new("Go to path", "goto", vec![form::text("path", "Path", &p.dir.display().to_string()).req(true)]))),
+                '.' => {
+                    p.hidden = !p.hidden;
+                    p.read();
+                }
+                '*' => {
+                    p.all = !p.all;
+                    p.read();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if key == 'U' {
+            let s = self.browsing.clone().or_else(|| self.sel().map(|s| js(s, "storage")));
+            if let Some(s) = s {
+                self.open_picker(&s);
+            }
+            return;
+        }
         if let Some(s) = self.browsing.clone() {
             match key {
                 'x' => {
@@ -1451,6 +1724,62 @@ impl View for Storage {
 
     fn on_form(&mut self, tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
         let n = ctx.node.clone();
+        if tag == "goto" {
+            if let Some(p) = &mut self.picker {
+                let raw = fv(v, "path").trim();
+                let path = if let Some(rest) = raw.strip_prefix("~") { home_dir().join(rest.trim_start_matches('/')) } else { std::path::PathBuf::from(raw) };
+                if path.is_dir() {
+                    p.cd(path);
+                } else if path.is_file() {
+                    let s = p.storage.clone();
+                    let f = self.upload_form(&s, &path);
+                    ctx.popup(Popup::Form(f));
+                } else {
+                    ctx.popup(Popup::error("Go to path", &format!("{}: not found", path.display())));
+                }
+            }
+            return;
+        }
+        if let Some(s) = tag.strip_prefix("upload:") {
+            let Some(path) = self.upload_file.clone() else { return };
+            let algo = fv(v, "algorithm").to_string();
+            let checksum = fv(v, "checksum").trim().to_string();
+            if algo != "none" && checksum.is_empty() {
+                ctx.popup(Popup::error("Upload file", "enter the checksum value, or set Checksum to none"));
+                return;
+            }
+            let filename = fv(v, "filename").trim().to_string();
+            let mut fields = vec![("content", fv(v, "content").to_string())];
+            if algo != "none" {
+                fields.push(("checksum", checksum));
+                fields.push(("checksum-algorithm", algo));
+            }
+            let api = ctx.api.clone();
+            let exec = if ctx.remote { None } else { ctx.exec_for(&n) };
+            let prog = std::sync::Arc::new(crate::api::UploadProgress::default());
+            let (p2, s2, fname, file) = (prog.clone(), s.to_string(), filename.clone(), path.clone());
+            let node = n.clone();
+            let job = Job::spawn(move || {
+                let size = std::fs::metadata(&file)?.len();
+                // pveproxy spools the upload to /var/tmp before moving it to the storage
+                if let Some(e) = exec {
+                    if let Ok(out) = e.output("df", &["-B1", "--output=avail", "/var/tmp"]) {
+                        if let Some(avail) = out.lines().last().and_then(|l| l.trim().parse::<u64>().ok()) {
+                            if avail < size + (64 << 20) {
+                                anyhow::bail!("not enough space in /var/tmp on {node}: {} free, {} needed", fmt_bytes(avail as f64), fmt_bytes(size as f64));
+                            }
+                        }
+                    }
+                }
+                api.upload(&format!("/nodes/{node}/storage/{s2}/upload"), &fields, &file, &fname, p2)
+            });
+            ctx.audit(&format!("upload {} to {s}", path.display()));
+            let title = format!("{} {filename} → {s}", tr("Upload"));
+            let tv = crate::ui::task::TaskView::upload(ctx.api.clone(), &n, &title, &path.display().to_string(), job, prog);
+            ctx.popup(Popup::Task(Box::new(tv)));
+            self.picker = None;
+            return;
+        }
         match tag {
             t if t.starts_with("download:") => {
                 let s = t["download:".len()..].to_string();
@@ -1504,6 +1833,7 @@ impl View for Storage {
 
     fn reset(&mut self) {
         self.data.clear();
+        self.picker = None;
         self.browsing = None;
         self.content.clear();
     }
