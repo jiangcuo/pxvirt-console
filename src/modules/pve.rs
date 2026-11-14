@@ -285,7 +285,6 @@ impl View for Cluster {
 struct GuestDetail {
     config: Value,
     status: Value,
-    ips: Vec<(String, String)>,
     snapshots: usize,
 }
 
@@ -309,6 +308,22 @@ struct Guests {
     snap_guest: String,
     create: Option<(bool, Job<CreateInfo>)>,
     nodes_for_form: Vec<String>,
+    /// node and architecture of the create wizard
+    create_node: (String, String),
+    /// node resources for the create wizard's node picker
+    create_nodes: Option<(bool, Job<Vec<Value>>)>,
+    /// IP addresses per guest (loaded on their own)
+    ips: HashMap<String, Loader<Vec<(String, String)>>>,
+    /// live monitor of the selected guest
+    live: HashMap<String, VmLive>,
+    live_job: Option<(String, Job<Value>)>,
+    rrd_job: Option<(String, Job<Vec<Value>>)>,
+    /// console preview: open connection of the selected guest, last image per guest, rendered protocol
+    stream: Option<crate::vnc::PreviewStream>,
+    /// last grab per guest: time, image, error
+    thumbs: HashMap<String, (std::time::Instant, Option<image::RgbImage>, String)>,
+    thumb_proto: Option<(String, std::time::Instant, (u16, u16), ratatui_image::protocol::Protocol)>,
+    preview_rect: Option<Rect>,
     initialized: bool,
     /// configuration page of one guest (Esc returns to the list)
     cfg: Option<super::guestcfg::GuestCfg>,
@@ -316,6 +331,119 @@ struct Guests {
 
 const GFILTERS: [&str; 7] = ["all", "running", "stopped", "VM", "CT", "foreign arch", "templates"];
 const GSORTS: [&str; 5] = ["id", "name", "cpu", "mem", "node"];
+
+/// Live usage of a guest: 3 s samples of status/current, prefilled from the last hour of rrddata.
+#[derive(Default)]
+struct VmLive {
+    /// last counters: time, netin, netout, diskread, diskwrite
+    last: Option<(std::time::Instant, f64, f64, f64, f64)>,
+    status: Value,
+    cpu: Vec<f64>,
+    mem: Vec<f64>,
+    net: Vec<f64>,
+    disk: Vec<f64>,
+    net_rate: (f64, f64),
+    disk_rate: (f64, f64),
+    at: Option<std::time::Instant>,
+    rrd_at: Option<std::time::Instant>,
+}
+
+const LIVE_HIST: usize = 120;
+
+fn hpush(h: &mut Vec<f64>, v: f64) {
+    h.push(v);
+    if h.len() > LIVE_HIST {
+        let n = h.len() - LIVE_HIST;
+        h.drain(..n);
+    }
+}
+
+impl VmLive {
+    fn sample(&mut self, s: Value) {
+        let now = std::time::Instant::now();
+        let (ni, no, dr, dw) = (jf(&s, "netin"), jf(&s, "netout"), jf(&s, "diskread"), jf(&s, "diskwrite"));
+        if let Some((t, pni, pno, pdr, pdw)) = self.last {
+            let dt = now.duration_since(t).as_secs_f64().max(0.1);
+            let r = |a: f64, b: f64| ((a - b) / dt).max(0.0);
+            self.net_rate = (r(ni, pni), r(no, pno));
+            self.disk_rate = (r(dr, pdr), r(dw, pdw));
+            hpush(&mut self.net, self.net_rate.0 + self.net_rate.1);
+            hpush(&mut self.disk, self.disk_rate.0 + self.disk_rate.1);
+        }
+        self.last = Some((now, ni, no, dr, dw));
+        hpush(&mut self.cpu, jf(&s, "cpu"));
+        let mm = jf(&s, "maxmem");
+        hpush(&mut self.mem, if mm > 0.0 { jf(&s, "mem") / mm } else { 0.0 });
+        self.status = s;
+    }
+
+    /// History from rrddata (minute averages of the last hour) before the live samples.
+    fn prefill(&mut self, rrd: &[Value]) {
+        let pts: Vec<&Value> = rrd.iter().filter(|p| p.get("cpu").map(|v| !v.is_null()).unwrap_or(false)).collect();
+        let take = |f: &dyn Fn(&Value) -> f64| -> Vec<f64> { pts.iter().map(|p| f(p)).collect() };
+        let join = |old: &[f64], new: Vec<f64>| -> Vec<f64> {
+            let mut v = new;
+            v.extend_from_slice(old);
+            let n = v.len().saturating_sub(LIVE_HIST);
+            v.drain(..n);
+            v
+        };
+        self.cpu = join(&self.cpu, take(&|p| jf(p, "cpu")));
+        self.mem = join(&self.mem, take(&|p| if jf(p, "maxmem") > 0.0 { jf(p, "mem") / jf(p, "maxmem") } else { 0.0 }));
+        self.net = join(&self.net, take(&|p| jf(p, "netin") + jf(p, "netout")));
+        self.disk = join(&self.disk, take(&|p| jf(p, "diskread") + jf(p, "diskwrite")));
+    }
+}
+
+/// Node picker score for new guests: free memory counts most, then idle CPU.
+/// Nodes with less than 2 GiB free memory are only chosen when nothing else is left.
+fn node_score(n: &Value) -> f64 {
+    let (mem, maxmem) = (jf(n, "mem"), jf(n, "maxmem"));
+    let free = (maxmem - mem).max(0.0);
+    let free_frac = if maxmem > 0.0 { free / maxmem } else { 0.0 };
+    let idle = 1.0 - jf(n, "cpu").clamp(0.0, 1.0);
+    let mut s = 0.55 * free_frac + 0.35 * idle + 0.10 * (jf(n, "maxcpu") / 256.0).min(1.0);
+    if free < 2.0 * 1024.0 * 1024.0 * 1024.0 {
+        s -= 1.0;
+    }
+    s
+}
+
+/// IP addresses of a running guest: QEMU guest agent, or the container's interfaces.
+fn guest_ips(api: &crate::api::Api, g: &Value) -> Vec<(String, String)> {
+    let base = Guests::base(g);
+    let mut ips = Vec::new();
+    if js(g, "type") == "qemu" {
+        if let Ok(v) = api.get(&format!("{base}/agent/network-get-interfaces")) {
+            for i in v.get("result").map(jarr).unwrap_or_default() {
+                let name = js(&i, "name");
+                if name == "lo" {
+                    continue;
+                }
+                for a in i.get("ip-addresses").map(jarr).unwrap_or_default() {
+                    let ip = js(&a, "ip-address");
+                    if !ip.starts_with("fe80") && !ip.starts_with("127.") && ip != "::1" {
+                        ips.push((name.clone(), format!("{ip}/{}", js(&a, "prefix"))));
+                    }
+                }
+            }
+        }
+    } else if let Ok(v) = api.get(&format!("{base}/interfaces")) {
+        for i in jarr(&v) {
+            let name = js(&i, "name");
+            if name == "lo" {
+                continue;
+            }
+            for k in ["inet", "inet6"] {
+                let ip = js(&i, k);
+                if !ip.is_empty() && !ip.starts_with("fe80") {
+                    ips.push((name.clone(), ip));
+                }
+            }
+        }
+    }
+    ips
+}
 
 fn gkey(g: &Value) -> String {
     format!("{}/{}/{}", js(g, "node"), js(g, "type"), js(g, "vmid"))
@@ -452,12 +580,19 @@ impl View for Guests {
                 if !missing.is_empty() || !nodes.is_empty() {
                     let api = ctx.api.clone();
                     self.batch.load(move || {
+                        // 8 requests at a time
                         let mut confs = Vec::new();
-                        for (k, node, t, id) in missing {
-                            match api.get(&format!("/nodes/{node}/{t}/{id}/config")) {
-                                Ok(c) => confs.push((k, c)),
-                                Err(_) => confs.push((k, Value::Null)),
-                            }
+                        for chunk in missing.chunks(8) {
+                            std::thread::scope(|sc| {
+                                let hs: Vec<_> = chunk
+                                    .iter()
+                                    .map(|(k, node, t, id)| {
+                                        let api = &api;
+                                        sc.spawn(move || (k.clone(), api.get(&format!("/nodes/{node}/{t}/{id}/config")).unwrap_or(Value::Null)))
+                                    })
+                                    .collect();
+                                confs.extend(hs.into_iter().filter_map(|h| h.join().ok()));
+                            });
                         }
                         let mut node_arch = HashMap::new();
                         for n in nodes {
@@ -482,46 +617,28 @@ impl View for Guests {
             let l = self.detail.entry(k.clone()).or_default();
             if l.stale(Duration::from_secs(10)) {
                 let api = ctx.api.clone();
+                let gd = g.clone();
                 l.load(move || {
-                    let base = Guests::base(&g);
-                    let config = api.get(&format!("{base}/config"))?;
-                    let status = api.get(&format!("{base}/status/current")).unwrap_or(Value::Null);
-                    let running = js(&status, "status") == "running";
-                    let mut ips = Vec::new();
-                    if running && js(&g, "type") == "qemu" && js(&config, "agent").starts_with('1') {
-                        if let Ok(v) = api.get(&format!("{base}/agent/network-get-interfaces")) {
-                            for i in v.get("result").map(jarr).unwrap_or_default() {
-                                let name = js(&i, "name");
-                                if name == "lo" {
-                                    continue;
-                                }
-                                for a in i.get("ip-addresses").map(jarr).unwrap_or_default() {
-                                    let ip = js(&a, "ip-address");
-                                    if !ip.starts_with("fe80") && !ip.starts_with("127.") && ip != "::1" {
-                                        ips.push((name.clone(), format!("{ip}/{}", js(&a, "prefix"))));
-                                    }
-                                }
-                            }
-                        }
-                    } else if running && js(&g, "type") == "lxc" {
-                        if let Ok(v) = api.get(&format!("{base}/interfaces")) {
-                            for i in jarr(&v) {
-                                let name = js(&i, "name");
-                                if name == "lo" {
-                                    continue;
-                                }
-                                for k in ["inet", "inet6"] {
-                                    let ip = js(&i, k);
-                                    if !ip.is_empty() && !ip.starts_with("fe80") {
-                                        ips.push((name.clone(), ip));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let snapshots = jarr(&api.get(&format!("{base}/snapshot")).unwrap_or(Value::Null)).iter().filter(|s| js(s, "name") != "current").count();
-                    Ok(GuestDetail { config, status, ips, snapshots })
+                    // config, status and snapshots in parallel; IPs come from their own loader
+                    let base = Guests::base(&gd);
+                    let (config, status, snapshots) = std::thread::scope(|sc| {
+                        let c = sc.spawn(|| api.get(&format!("{base}/config")));
+                        let st = sc.spawn(|| api.get(&format!("{base}/status/current")).unwrap_or(Value::Null));
+                        let sn = sc.spawn(|| jarr(&api.get(&format!("{base}/snapshot")).unwrap_or(Value::Null)).iter().filter(|s| js(s, "name") != "current").count());
+                        (c.join().unwrap_or_else(|_| Err(anyhow::anyhow!("worker panicked"))), st.join().unwrap_or(Value::Null), sn.join().unwrap_or(0))
+                    });
+                    Ok(GuestDetail { config: config?, status, snapshots })
                 });
+            }
+            // IP addresses (guest agent / container interfaces) separately: a slow agent must not
+            // hold up the rest of the details
+            let running = js(&g, "status") == "running";
+            let il = self.ips.entry(k.clone()).or_default();
+            ch |= il.poll();
+            if running && il.stale(Duration::from_secs(30)) {
+                let api = ctx.api.clone();
+                let g2 = g.clone();
+                il.load(move || Ok(guest_ips(&api, &g2)));
             }
             if let Some(Some(c)) = self.detail.get(&k).map(|d| d.data.as_ref().map(|d| d.config.clone())) {
                 self.confs.insert(k, c);
@@ -542,6 +659,18 @@ impl View for Guests {
                 }
             }
         }
+        ch |= self.poll_live(ctx);
+        // node resources for the create wizard
+        if let Some((vm, job)) = &self.create_nodes {
+            if let Some(r) = job.poll() {
+                let vm = *vm;
+                self.create_nodes = None;
+                match r {
+                    Ok(res) => self.open_node_picker(ctx, vm, res),
+                    Err(e) => ctx.popup(Popup::error("Create", &format!("{e:#}"))),
+                }
+            }
+        }
         // create wizard data
         if let Some((is_vm, job)) = &self.create {
             if let Some(r) = job.poll() {
@@ -549,6 +678,7 @@ impl View for Guests {
                 self.create = None;
                 match r {
                     Ok(info) => {
+                        self.create_node = (info.node.clone(), info.arch.clone());
                         let f = if is_vm { pve_create::vm_form(&info) } else { pve_create::ct_form(&info) };
                         ctx.popup(Popup::Form(f));
                     }
@@ -701,9 +831,10 @@ impl View for Guests {
                         kv.add("QEMU", format!("{} {}", js(s, "running-qemu"), js(s, "running-machine")));
                     }
                 }
-                if !d.ips.is_empty() {
+                let ips = self.ips.get(&k).and_then(|l| l.data.clone()).unwrap_or_default();
+                if !ips.is_empty() {
                     kv.section("IP addresses");
-                    for (i, ip) in &d.ips {
+                    for (i, ip) in &ips {
                         kv.add(i, ip.clone());
                     }
                 }
@@ -757,7 +888,24 @@ impl View for Guests {
                 kv.styled("", tr("Loading..."), style_dim());
             }
         }
-        draw_lines(f, area, "Details", focused, kv.lines(), self.scroll);
+        self.draw_panes(f, area, focused, kv.lines());
+    }
+
+    fn on_click(&mut self, x: u16, y: u16, ctx: &mut Ctx) -> bool {
+        if self.cfg.is_some() {
+            return false;
+        }
+        let Some(r) = self.preview_rect else { return false };
+        if x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height {
+            return false;
+        }
+        let Some(g) = self.sel().cloned() else { return false };
+        if js(&g, "status") != "running" || js(&g, "type") != "qemu" {
+            return false;
+        }
+        let vmid = js(&g, "vmid").parse().unwrap_or(0);
+        ctx.cmds.push(Cmd::Vnc(VncRequest { node: js(&g, "node"), vmid, name: gname(&g) }));
+        true
     }
 
     fn scroll_detail(&mut self, d: i32) {
@@ -868,6 +1016,13 @@ impl View for Guests {
                 return;
             }
             "migrate_mode" => return,
+            t if t.starts_with("create_node:") => {
+                let keys: Vec<char> = "123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
+                if let Some(node) = keys.iter().position(|c| *c == key).and_then(|i| self.nodes_for_form.get(i)).cloned() {
+                    self.create_on(ctx, t.ends_with(":vm"), node);
+                }
+                return;
+            }
             _ => {}
         }
         let Some(g) = self.sel().cloned() else {
@@ -1049,7 +1204,8 @@ impl View for Guests {
             return c.on_form(tag, v, ctx);
         }
         if tag == "create_vm" || tag == "create_ct" {
-            pve_create::submit(tag, v, ctx);
+            let (node, arch) = self.create_node.clone();
+            pve_create::submit(tag, v, ctx, &node, &arch);
             return;
         }
         if tag == "snap" {
@@ -1118,10 +1274,268 @@ impl View for Guests {
 }
 
 impl Guests {
+    /// Create VM / CT: pick the node first when the cluster has more than one online node.
     fn start_create(&mut self, ctx: &mut Ctx, vm: bool) {
-        let api = ctx.api.clone();
+        let online: Vec<String> = ctx.nodes.iter().filter(|n| n.online).map(|n| n.name.clone()).collect();
+        if online.len() > 1 {
+            let api = ctx.api.clone();
+            ctx.toast(format!("{}...", tr("Loading nodes")));
+            self.create_nodes = Some((vm, Job::spawn(move || Ok(jarr(&api.get("/cluster/resources?type=node")?)))));
+            return;
+        }
         let node = ctx.node.clone();
+        self.create_on(ctx, vm, node);
+    }
+
+    /// Details of a guest in three panes: configuration (scrolls), live monitor, console preview.
+    fn draw_panes(&mut self, f: &mut Frame, area: Rect, focused: bool, config: Vec<ratatui::text::Line<'static>>) {
+        use ratatui::layout::Constraint as C;
+        let Some(g) = self.sel().cloned() else {
+            self.preview_rect = None;
+            return draw_lines(f, area, "Details", focused, config, self.scroll);
+        };
+        if area.height < 18 {
+            self.preview_rect = None;
+            return draw_lines(f, area, "Details", focused, config, self.scroll);
+        }
+        let k = gkey(&g);
+        let preview = js(&g, "type") == "qemu" && crate::vnc::picker().is_some() && area.height >= 30;
+        let mon_h = 9;
+        let cons: Vec<C> = if preview { vec![C::Min(6), C::Length(mon_h), C::Percentage(40)] } else { vec![C::Min(6), C::Length(mon_h)] };
+        let parts = crate::ui::vsplit(area, &cons);
+        draw_lines(f, parts[0], "Configuration", focused, config, self.scroll);
+        let mon = self.monitor_lines(&g, &k, parts[1].width.saturating_sub(2) as usize);
+        draw_lines(f, parts[1], "Monitor", false, mon, 0);
+        if preview {
+            self.draw_preview(f, parts[2], &g, &k);
+        } else {
+            self.preview_rect = None;
+        }
+    }
+
+    fn monitor_lines(&self, g: &Value, k: &str, width: usize) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::text::{Line, Span};
+        let live = self.live.get(k);
+        let st = live.map(|l| &l.status).filter(|s| !s.is_null()).unwrap_or(g);
+        let status = js(st, "status");
+        let running = status == "running";
+        let mut out = Vec::new();
+        let mut head = vec![Span::styled(format!("{} {}", if running { "▲" } else { "▼" }, status), status_style(&status))];
+        if running {
+            head.push(Span::raw(format!("   {} {}", tr("Uptime"), fmt_duration(jf(st, "uptime") as u64))));
+        }
+        let qmp = js(st, "qmpstatus");
+        if !qmp.is_empty() && qmp != status {
+            head.push(Span::styled(format!("   ({qmp})"), style_warn()));
+        }
+        if !js(g, "hastate").is_empty() {
+            head.push(Span::raw(format!("   HA {}", js(g, "hastate"))));
+        }
+        out.push(Line::from(head));
+        let ips: Vec<String> = self.ips.get(k).and_then(|l| l.data.as_ref()).map(|v| v.iter().map(|(_, ip)| ip.clone()).collect()).unwrap_or_default();
+        out.push(Line::from(vec![
+            Span::styled(format!("{:<6}", "IP"), crate::ui::style_label()),
+            if ips.is_empty() {
+                Span::styled(tr(if running { "unknown (guest agent?)" } else { "-" }).to_string(), style_dim())
+            } else {
+                Span::raw(ips.join("  "))
+            },
+        ]));
+        let spark_w = width.saturating_sub(32).max(8);
+        let mut metric = |label: &str, value: String, hist: &[f64], max: Option<f64>, style: Style| {
+            out.push(Line::from(vec![
+                Span::styled(format!("{:<6}", tr(label)), crate::ui::style_label()),
+                Span::styled(format!("{:<26}", value), style),
+                Span::styled(crate::ui::sparkline(hist, spark_w, max), style),
+            ]));
+        };
+        let empty: Vec<f64> = vec![];
+        let cpu = jf(st, "cpu");
+        let (mem, maxmem) = (jf(st, "mem"), jf(st, "maxmem"));
+        let mf = if maxmem > 0.0 { mem / maxmem } else { 0.0 };
+        metric("CPU", format!("{:.1}% / {} vCPU", cpu * 100.0, js(st, "cpus")), live.map(|l| &l.cpu[..]).unwrap_or(&empty), Some(1.0), usage_style(cpu));
+        metric("Memory", format!("{} / {} {:.0}%", fmt_bytes(mem), fmt_bytes(maxmem), mf * 100.0), live.map(|l| &l.mem[..]).unwrap_or(&empty), Some(1.0), usage_style(mf));
+        let (nr, ndisk) = live.map(|l| (l.net_rate, l.disk_rate)).unwrap_or_default();
+        metric("Network", format!("↓{} ↑{}", crate::util::fmt_rate(nr.0), crate::util::fmt_rate(nr.1)), live.map(|l| &l.net[..]).unwrap_or(&empty), None, Style::default().fg(ACCENT));
+        metric("Disk", format!("R {} W {}", crate::util::fmt_rate(ndisk.0), crate::util::fmt_rate(ndisk.1)), live.map(|l| &l.disk[..]).unwrap_or(&empty), None, style_warn());
+        out
+    }
+
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect, g: &Value, k: &str) {
+        let running = js(g, "status") == "running";
+        let title = format!("{} · {}", tr("Console"), tr("click or press v to open"));
+        let blk = crate::ui::block(&title, false);
+        let inner = blk.inner(area);
+        f.render_widget(blk, area);
+        self.preview_rect = Some(area);
+        if let Some(st) = &self.stream {
+            st.state.lock().unwrap().shown = Some(std::time::Instant::now());
+        }
+        let msg = |f: &mut Frame, t: String| f.render_widget(ratatui::widgets::Paragraph::new(t).style(style_dim()), inner);
+        if !running {
+            return msg(f, tr("not running").to_string());
+        }
+        match self.thumbs.get(k) {
+            Some((t, Some(img), _)) => {
+                let size = (inner.width, inner.height);
+                let fresh = matches!(&self.thumb_proto, Some((pk, pt, ps, _)) if pk == k && pt == t && *ps == size);
+                if !fresh {
+                    if let Some(p) = crate::vnc::picker() {
+                        if let Ok(proto) = p.new_protocol(image::DynamicImage::ImageRgb8(img.clone()), ratatui::layout::Size::new(inner.width, inner.height), ratatui_image::Resize::Fit(None)) {
+                            self.thumb_proto = Some((k.to_string(), *t, size, proto));
+                        }
+                    }
+                }
+                if let Some((pk, _, _, proto)) = &self.thumb_proto {
+                    if pk == k {
+                        f.render_widget(ratatui_image::Image::new(proto), inner);
+                    }
+                }
+            }
+            Some((_, None, err)) => msg(f, format!("{}: {err}", tr("Preview unavailable"))),
+            None => msg(f, tr("Loading preview...").to_string()),
+        }
+    }
+
+    /// Live monitor and console preview of the selected guest.
+    fn poll_live(&mut self, ctx: &mut Ctx) -> bool {
+        use std::time::{Duration as D, Instant};
+        let mut ch = false;
+        if let Some((k, job)) = &self.live_job {
+            if let Some(r) = job.poll() {
+                let k = k.clone();
+                self.live_job = None;
+                if let Ok(v) = r {
+                    self.live.entry(k).or_default().sample(v);
+                    ch = true;
+                }
+            }
+        }
+        if let Some((k, job)) = &self.rrd_job {
+            if let Some(r) = job.poll() {
+                let k = k.clone();
+                self.rrd_job = None;
+                if let Ok(v) = r {
+                    self.live.entry(k).or_default().prefill(&v);
+                    ch = true;
+                }
+            }
+        }
+        // copy the newest frame of the open preview connection
+        if let Some(st) = &self.stream {
+            let s = st.state.lock().unwrap();
+            let key = st.key.clone();
+            if s.idle {
+                drop(s);
+                self.stream = None;
+                return ch;
+            }
+            match (&s.img, s.err.is_empty()) {
+                (Some((t, img)), _) if self.thumbs.get(&key).map(|x| x.0 != *t).unwrap_or(true) => {
+                    self.thumbs.insert(key, (*t, Some(img.clone()), String::new()));
+                    ch = true;
+                }
+                (None, false) => {
+                    let e = s.err.clone();
+                    drop(s);
+                    self.thumbs.insert(key, (Instant::now(), None, e));
+                    self.stream = None;
+                    ch = true;
+                }
+                _ => {}
+            }
+        }
+        let Some(g) = self.sel().cloned() else { return ch };
+        let k = gkey(&g);
+        let base = Self::base(&g);
+        let running = js(&g, "status") == "running";
+        let l = self.live.entry(k.clone()).or_default();
+        if self.live_job.is_none() && l.at.map(|t| t.elapsed() >= D::from_secs(3)).unwrap_or(true) {
+            l.at = Some(Instant::now());
+            let (api, b) = (ctx.api.clone(), base.clone());
+            self.live_job = Some((k.clone(), Job::spawn(move || api.get(&format!("{b}/status/current")))));
+        }
+        if self.rrd_job.is_none() && l.rrd_at.is_none() {
+            l.rrd_at = Some(Instant::now());
+            let (api, b) = (ctx.api.clone(), base.clone());
+            self.rrd_job = Some((k.clone(), Job::spawn(move || Ok(jarr(&api.get(&format!("{b}/rrddata?timeframe=hour&cf=AVERAGE"))?)))));
+        }
+        let is_vm = js(&g, "type") == "qemu";
+        // one preview connection, for the selected running VM while the preview pane is shown
+        let wanted = is_vm && running && self.preview_rect.is_some() && crate::vnc::picker().is_some() && !jb(&g, "template");
+        if !wanted || self.stream.as_ref().map(|st| st.key != k).unwrap_or(false) {
+            self.stream = None;
+        }
+        // after an error, retry the connection after 30 s
+        let retry_ok = match self.thumbs.get(&k) {
+            Some((t, None, _)) => t.elapsed() >= D::from_secs(30),
+            _ => true,
+        };
+        if wanted && self.stream.is_none() && retry_ok {
+            let node = js(&g, "node");
+            let vmid: u32 = js(&g, "vmid").parse().unwrap_or(0);
+            // same path as the console: qm vncproxy as root with host access, else the API websocket
+            let exec = match (ctx.session.is_root() || ctx.session.rescue, ctx.exec_for(&node)) {
+                (true, Some(e)) if !ctx.remote => Some(e),
+                _ => None,
+            };
+            if exec.is_some() || !ctx.session.rescue {
+                self.stream = Some(crate::vnc::PreviewStream::start(k.clone(), ctx.api.clone(), exec, node, vmid, 800));
+            }
+        }
+        ch
+    }
+
+    /// Node menu with resources; the best node (see `node_score`) is preselected and marked.
+    fn open_node_picker(&mut self, ctx: &mut Ctx, vm: bool, res: Vec<Value>) {
+        let mut nodes: Vec<Value> = res.into_iter().filter(|n| js(n, "status") == "online").collect();
+        nodes.sort_by_key(|n| js(n, "node"));
+        if nodes.is_empty() {
+            let node = ctx.node.clone();
+            return self.create_on(ctx, vm, node);
+        }
+        let best = nodes.iter().enumerate().max_by(|a, b| node_score(a.1).partial_cmp(&node_score(b.1)).unwrap_or(std::cmp::Ordering::Equal)).map(|x| x.0).unwrap_or(0);
+        let keys: Vec<char> = "123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
+        let w = nodes.iter().map(|n| js(n, "node").len()).max().unwrap_or(8);
+        let items: Vec<MenuItem> = nodes
+            .iter()
+            .zip(keys.iter())
+            .enumerate()
+            .map(|(i, (n, k))| {
+                let name = js(n, "node");
+                let arch = ctx.node_arch.get(&name).cloned().unwrap_or_default();
+                let (mem, maxmem) = (jf(n, "mem"), jf(n, "maxmem"));
+                item(
+                    *k,
+                    &format!(
+                        "{name:<w$}  {:<7} CPU {:>3.0}% / {:<3} {}  {} {} {:>7} / {:<7}{}{}",
+                        arch,
+                        jf(n, "cpu") * 100.0,
+                        jf(n, "maxcpu"),
+                        tr("cores"),
+                        tr("Memory"),
+                        tr("free"),
+                        fmt_bytes(maxmem - mem),
+                        fmt_bytes(maxmem),
+                        if name == ctx.node { "  *" } else { "" },
+                        if i == best { format!("  ★ {}", tr("recommended")) } else { String::new() }
+                    ),
+                )
+            })
+            .collect();
+        self.nodes_for_form = nodes.iter().map(|n| js(n, "node")).collect();
+        let title = tr(if vm { "Create VM on node" } else { "Create CT on node" }).to_string();
+        let mut menu = Popup::menu(&title, if vm { "create_node:vm" } else { "create_node:ct" }, items);
+        if let Popup::Menu(m) = &mut menu {
+            m.sel = best;
+        }
+        ctx.popup(menu);
+    }
+
+    fn create_on(&mut self, ctx: &mut Ctx, vm: bool, node: String) {
+        let api = ctx.api.clone();
         let arch = ctx.node_arch.get(&node).cloned().unwrap_or_default();
+        self.create_node = (node.clone(), arch.clone());
         self.nodes_for_form = ctx.nodes.iter().map(|n| n.name.clone()).collect();
         ctx.toast(format!("{}...", tr(if vm { "Create VM" } else { "Create CT" })));
         self.create = Some((vm, Job::spawn(move || pve_create::load_info(&api, &node, &arch))));
@@ -2056,7 +2470,7 @@ impl View for Ha {
             item('d', "Request state: disabled").require(m.clone()).disabled_if(!sel, "nothing selected"),
             item('X', "Remove from HA").require(m).disabled_if(!sel, "nothing selected"),
             item('M', "Node maintenance mode on").require(ctx.need_root()).require(ctx.need_exec("Sys.Modify").map(|_| ())),
-            item('m', "Node maintenance mode off").require(ctx.need_root()).require(ctx.need_exec("Sys.Modify").map(|_| ())),
+            item('n', "Node maintenance mode off").require(ctx.need_root()).require(ctx.need_exec("Sys.Modify").map(|_| ())),
         ]
     }
 
@@ -2072,7 +2486,7 @@ impl View for Ha {
                 ctx.api_call(format!("HA {sid} -> {state}"), "PUT", format!("/cluster/ha/resources/{sid}"), vec![("state", state.into())]);
             }
             'X' => ctx.popup(Popup::confirm("Remove from HA", &format!("rm:{sid}"), vec![format!("Remove {sid} from HA management?")], false)),
-            'M' | 'm' => {
+            'M' | 'n' => {
                 if let Some(e) = ctx.exec() {
                     let a = if key == 'M' { "enable" } else { "disable" };
                     let node = ctx.node.clone();
@@ -2188,4 +2602,36 @@ impl View for Replication {
 /// Display name of a guest (punycode decoded).
 fn gname(g: &Value) -> String {
     crate::util::guest_name(&js(g, "name"))
+}
+
+#[cfg(test)]
+mod node_pick_tests {
+    use super::*;
+
+    #[test]
+    fn best_node_prefers_free_memory_then_idle_cpu() {
+        let g = 1024.0 * 1024.0 * 1024.0;
+        let n = |name: &str, cpu: f64, maxcpu: f64, mem: f64, maxmem: f64| serde_json::json!({"node": name, "status": "online", "cpu": cpu, "maxcpu": maxcpu, "mem": mem * g, "maxmem": maxmem * g});
+        let busy = n("busy", 0.9, 64.0, 200.0, 256.0);
+        let roomy = n("roomy", 0.3, 32.0, 40.0, 256.0);
+        let idle_small = n("idle-small", 0.0, 8.0, 30.0, 31.0);
+        assert!(node_score(&roomy) > node_score(&busy));
+        // almost no free memory loses even when idle
+        assert!(node_score(&busy) > node_score(&idle_small));
+        let mut v = vec![busy, roomy, idle_small];
+        v.sort_by(|a, b| node_score(b).partial_cmp(&node_score(a)).unwrap());
+        assert_eq!(js(&v[0], "node"), "roomy");
+    }
+
+    #[test]
+    fn live_rates_and_prefill() {
+        let mut l = VmLive::default();
+        l.prefill(&[serde_json::json!({"cpu": 0.5, "mem": 1.0, "maxmem": 4.0, "netin": 10.0, "netout": 5.0, "diskread": 1.0, "diskwrite": 2.0})]);
+        assert_eq!((l.cpu.len(), l.mem[0], l.net[0], l.disk[0]), (1, 0.25, 15.0, 3.0));
+        l.sample(serde_json::json!({"cpu": 0.1, "mem": 2.0, "maxmem": 4.0, "netin": 1000.0, "netout": 0.0, "diskread": 0.0, "diskwrite": 0.0}));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        l.sample(serde_json::json!({"cpu": 0.2, "mem": 2.0, "maxmem": 4.0, "netin": 3000.0, "netout": 0.0, "diskread": 0.0, "diskwrite": 0.0}));
+        assert_eq!(l.cpu.len(), 3);
+        assert!(l.net_rate.0 > 5000.0 && l.net_rate.0 < 10001.0, "{}", l.net_rate.0);
+    }
 }

@@ -1,0 +1,10 @@
+[package]
+name = "pxvirt-raid"
+version = "0.1.0"
+edition = "2021"
+description = "Hardware RAID / HBA / NVMe management through the vendor command line tools"
+authors = ["lierfang"]
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"

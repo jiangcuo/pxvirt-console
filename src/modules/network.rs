@@ -25,6 +25,7 @@ pub fn views() -> Vec<Box<dyn View>> {
         Box::new(super::netmgmt::Mgmt::default()),
         Box::new(Interfaces::default()),
         Box::new(Traffic::default()),
+        Box::new(super::conns::Conns::default()),
         Box::new(Tools::default()),
         Box::new(Routes::default()),
         Box::new(Firewall::default()),

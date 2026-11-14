@@ -11,6 +11,7 @@ mod metrics;
 mod modules;
 #[allow(dead_code)] // full copy of the pxvdi-sdk module
 mod punycode;
+mod raidhost;
 mod rescue;
 mod sshconn;
 mod ui;
@@ -182,6 +183,8 @@ fn main() -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(backend::ConsoleBackend::new(stdout))?;
     terminal.clear()?;
+    // graphics support for console previews (before the event loop reads stdin)
+    vnc::init_picker();
 
     let res = if let Some(sock) = args.vnc_test {
         i18n::init(&cfg.lang);

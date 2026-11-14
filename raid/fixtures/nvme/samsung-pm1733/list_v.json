@@ -1,0 +1,42 @@
+{
+  "Devices":[
+    {
+      "HostNQN":"nqn.2014-08.org.nvmexpress:uuid:3cdc9dc0-6012-b135-ea11-d1b73eef1588",
+      "HostID":"6a855814-a61c-407c-a60a-dab7678b2c60",
+      "Subsystems":[
+        {
+          "Subsystem":"nvme-subsys0",
+          "SubsystemNQN":"nqn.1994-11.com.samsung:nvme:PM1733:HHHL:S5LCNC0RC00530",
+          "Controllers":[
+            {
+              "Controller":"nvme0",
+              "SerialNumber":"S5LCNC0RC00530",
+              "ModelNumber":"SAMSUNG MZPLJ1T6HBJR-0007C",
+              "Firmware":"EPK9CJ5Q",
+              "Transport":"pcie",
+              "Address":"0000:86:00.0",
+              "Namespaces":[
+              ],
+              "Paths":[
+                {
+                  "Path":"nvme0c0n1",
+                  "ANAState":"optimized"
+                }
+              ]
+            }
+          ],
+          "Namespaces":[
+            {
+              "NameSpace":"nvme0n1",
+              "NSID":1,
+              "UsedBytes":1600321314816,
+              "MaximumLBA":3125627568,
+              "PhysicalSize":1600321314816,
+              "SectorSize":512
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

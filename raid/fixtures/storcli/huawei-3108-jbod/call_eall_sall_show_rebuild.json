@@ -1,0 +1,75 @@
+{
+"Controllers":[
+{
+	"Command Status" : {
+		"CLI Version" : "007.3703.0000.0000 Jan 16, 2026",
+		"Operating system" : "Linux 6.6.0-11-openeuler",
+		"Controller" : 0,
+		"Status" : "Success",
+		"Description" : "Show Drive Rebuild Status Succeeded."
+	},
+	"Response Data" : [
+		{
+			"Drive-ID" : "/c0/e4/s1",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s2",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s3",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s4",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s5",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s6",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s7",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s8",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s10",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		},
+		{
+			"Drive-ID" : "/c0/e4/s11",
+			"Progress%" : "-",
+			"Status" : "Not in progress",
+			"Estimated Time Left" : "-"
+		}
+	]
+}
+]
+}

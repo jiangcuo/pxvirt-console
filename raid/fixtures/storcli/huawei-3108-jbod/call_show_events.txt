@@ -1,0 +1,258 @@
+
+
+seqNum: 0x00004429
+Time: Sat Nov  7 03:23:22 2026
+
+Code: 0x0000003a
+Class: 0
+Locale: 0x01
+Event Description: Consistency Check done on VD ef/0
+Event Data:
+===========
+Target Id: 239
+
+
+seqNum: 0x00004428
+Time: Sat Nov  7 03:23:08 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 98.94%(1387s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004427
+Time: Sat Nov  7 03:22:41 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 96.94%(1360s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004426
+Time: Sat Nov  7 03:22:14 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 94.94%(1333s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004425
+Time: Sat Nov  7 03:21:47 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 92.95%(1306s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004424
+Time: Sat Nov  7 03:21:20 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 90.95%(1279s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004423
+Time: Sat Nov  7 03:20:53 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 88.95%(1252s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004422
+Time: Sat Nov  7 03:20:25 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 86.95%(1224s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004421
+Time: Sat Nov  7 03:19:59 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 84.95%(1198s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004420
+Time: Sat Nov  7 03:19:31 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 82.95%(1170s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x0000441f
+Time: Sat Nov  7 03:19:04 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 80.95%(1143s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x0000441e
+Time: Sat Nov  7 03:18:38 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 78.95%(1118s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x0000441d
+Time: Sat Nov  7 03:18:11 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 76.95%(1091s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x0000441c
+Time: Sat Nov  7 03:17:44 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 74.95%(1064s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x0000441b
+Time: Sat Nov  7 03:17:17 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 72.96%(1037s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x0000441a
+Time: Sat Nov  7 03:16:50 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 70.96%(1010s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004419
+Time: Sat Nov  7 03:16:23 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 68.96%(983s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004418
+Time: Sat Nov  7 03:15:56 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 66.96%(956s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004417
+Time: Sat Nov  7 03:15:29 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 64.96%(929s)
+Event Data:
+===========
+None
+
+
+seqNum: 0x00004416
+Time: Sat Nov  7 03:15:01 2026
+
+Code: 0x00000041
+Class: -1
+Locale: 0x01
+Event Description: Consistency Check progress on VD ef/0 is 62.96%(901s)
+Event Data:
+===========
+None
+CLI Version = 007.3703.0000.0000 Jan 16, 2026
+Operating system = Linux 6.6.0-11-openeuler
+Controller = 0
+Status = Success
+Description = None
+
+Latest Event = 20
+
+Controller Properties :
+=====================
+
+------------------------------------
+Ctrl Status  Method    Value        
+------------------------------------
+   0 Success GetLatest Latest Event 
+------------------------------------
+
+

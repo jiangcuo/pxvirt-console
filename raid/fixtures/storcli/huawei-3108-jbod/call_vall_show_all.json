@@ -1,0 +1,83 @@
+{
+"Controllers":[
+{
+	"Command Status" : {
+		"CLI Version" : "007.3703.0000.0000 Jan 16, 2026",
+		"Operating system" : "Linux 6.6.0-11-openeuler",
+		"Controller" : 0,
+		"Status" : "Success",
+		"Description" : "None"
+	},
+	"Response Data" : {
+		"/c0/v239" : [
+			{
+				"DG/VD" : "0/239",
+				"TYPE" : "RAID1",
+				"State" : "Optl",
+				"Access" : "RW",
+				"Consist" : "Yes",
+				"Cache" : "RWTD",
+				"Cac" : "-",
+				"sCC" : "ON",
+				"Size" : "446.625 GB",
+				"Name" : ""
+			}
+		],
+		"PDs for VD 239" : [
+			{
+				"EID:Slt" : "4:1",
+				"DID" : 5,
+				"State" : "Onln",
+				"DG" : 0,
+				"Size" : "446.625 GB",
+				"Intf" : "SATA",
+				"Med" : "SSD",
+				"SED" : "N",
+				"PI" : "N",
+				"SeSz" : "512B",
+				"Model" : "KIOXIA-EXCERIA SATA SSD",
+				"Sp" : "U",
+				"Type" : "-"
+			},
+			{
+				"EID:Slt" : "4:2",
+				"DID" : 6,
+				"State" : "Onln",
+				"DG" : 0,
+				"Size" : "446.625 GB",
+				"Intf" : "SATA",
+				"Med" : "SSD",
+				"SED" : "N",
+				"PI" : "N",
+				"SeSz" : "512B",
+				"Model" : "KIOXIA-EXCERIA SATA SSD",
+				"Sp" : "U",
+				"Type" : "-"
+			}
+		],
+		"VD239 Properties" : {
+			"Strip Size" : "256 KB",
+			"Number of Blocks" : 936640512,
+			"VD has Emulated PD" : "No",
+			"Span Depth" : 1,
+			"Number of Drives Per Span" : 2,
+			"Write Cache(initial setting)" : "WriteThrough",
+			"Disk Cache Policy" : "Disk's Default",
+			"Encryption" : "None",
+			"Data Protection" : "Disabled",
+			"Active Operations" : "None",
+			"Exposed to OS" : "Yes",
+			"OS Drive Name" : "/dev/sdi",
+			"Creation Date" : "07-08-2025",
+			"Creation Time" : "06:40:15 AM",
+			"Emulation type" : "default",
+			"Cachebypass size" : "Cachebypass-64k",
+			"Cachebypass Mode" : "Cachebypass Intelligent",
+			"Is LD Ready for OS Requests" : "Yes",
+			"SCSI NAA Id" : "620000235e527756302706cf0540adce",
+			"Unmap Enabled" : "N/A"
+		}
+	}
+}
+]
+}

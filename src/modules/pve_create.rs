@@ -66,7 +66,7 @@ pub fn vm_form(i: &CreateInfo) -> Form {
         .map(|a| (a.to_string(), if *a == i.arch { format!("{a} (native, KVM)") } else { format!("{a} (emulated, TCG)") }))
         .collect();
     Form::new(
-        &format!("Create VM on {}", i.node),
+        &format!("{} {}", crate::i18n::tr("Create VM on"), i.node),
         "create_vm",
         vec![
             form::info("Node", &format!("{} ({})", i.node, i.arch)),
@@ -75,6 +75,7 @@ pub fn vm_form(i: &CreateInfo) -> Form {
             form::select("arch", "Architecture", arches, &i.arch).help("other architectures run emulated (slow), root@pam only"),
             form::select("ostype", "Guest OS", form::opts(&["l26", "win11", "win10", "w2k22", "w2k19", "other"]), "l26"),
             form::select("iso", "CD/DVD image", i.isos.clone(), "none"),
+            form::select("iso2", "Second CD/DVD", i.isos.clone(), "none").help("e.g. the virtio-win driver ISO for Windows guests"),
             form::select("bios", "Firmware", vec![("seabios".into(), "SeaBIOS (legacy)".into()), ("ovmf".into(), "OVMF (UEFI)".into())], if i.arch == "x86_64" { "seabios" } else { "ovmf" })
                 .help("non-x86 guests always use UEFI"),
             form::number("sockets", "Sockets", "1"),
@@ -95,7 +96,7 @@ pub fn vm_form(i: &CreateInfo) -> Form {
 
 pub fn ct_form(i: &CreateInfo) -> Form {
     Form::new(
-        &format!("Create CT on {}", i.node),
+        &format!("{} {}", crate::i18n::tr("Create CT on"), i.node),
         "create_ct",
         vec![
             form::info("Node", &format!("{} ({})", i.node, i.arch)),
@@ -121,9 +122,10 @@ pub fn ct_form(i: &CreateInfo) -> Form {
     )
 }
 
-pub fn submit(tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
-    let node = ctx.node.clone();
-    let node_arch = ctx.node_arch.get(&node).cloned().unwrap_or_else(|| "x86_64".into());
+/// Create on `node` (the node chosen for the wizard, not necessarily the one being viewed).
+pub fn submit(tag: &str, v: &[(String, String)], ctx: &mut Ctx, node: &str, node_arch: &str) {
+    let node = node.to_string();
+    let node_arch = if node_arch.is_empty() { "x86_64".to_string() } else { node_arch.to_string() };
     if tag == "create_vm" {
         let arch = fv(v, "arch").to_string();
         let foreign = !arch.is_empty() && arch != node_arch;
@@ -159,13 +161,17 @@ pub fn submit(tag: &str, v: &[(String, String)], ctx: &mut Ctx) {
             p.push(("vga", "virtio".into()));
         }
         let iso = fv(v, "iso").to_string();
-        // x86 uses IDE for the CD drive; other machines have no IDE controller
-        let cd_key: &'static str = if arch == "x86_64" { "ide2" } else { "scsi2" };
+        let iso2 = fv(v, "iso2").to_string();
+        // x86 uses IDE for the CD drives; other machines have no IDE controller
+        let (cd_key, cd2_key): (&'static str, &'static str) = if arch == "x86_64" { ("ide2", "ide0") } else { ("scsi2", "scsi3") };
         if iso != "none" && !iso.is_empty() {
             p.push((cd_key, format!("{iso},media=cdrom")));
             p.push(("boot", format!("order={disk_key};{cd_key}")));
         } else {
             p.push(("boot", format!("order={disk_key}")));
+        }
+        if iso2 != "none" && !iso2.is_empty() {
+            p.push((cd2_key, format!("{iso2},media=cdrom")));
         }
         p.push(("bios", bios.clone()));
         if bios == "ovmf" {

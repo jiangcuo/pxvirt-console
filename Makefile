@@ -4,7 +4,7 @@ include /usr/share/dpkg/default.mk
 BUILD_DIR := build
 
 # 需要复制的文件和目录
-COPY_ITEMS := build.rs src debian Cargo.toml
+COPY_ITEMS := build.rs src raid debian Cargo.toml Cargo.lock
 
 .PHONY: deb clean 
 

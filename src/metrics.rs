@@ -30,6 +30,39 @@ pub struct IfaceStat {
     pub tx_hist: Vec<f64>,
 }
 
+/// IO of one block device (from /proc/diskstats deltas).
+#[derive(Clone, Default)]
+pub struct DiskStat {
+    pub name: String,
+    /// has /sys/block/<name>/device (a disk, not dm / md / zd...)
+    pub physical: bool,
+    pub r_bps: f64,
+    pub w_bps: f64,
+    pub r_iops: f64,
+    pub w_iops: f64,
+    /// average latency of the completed reads / writes (ms)
+    pub r_await: f64,
+    pub w_await: f64,
+    /// share of time with IO in flight (0..1)
+    pub util: f64,
+    /// requests in flight right now
+    pub inflight: u64,
+    pub r_total: u64,
+    pub w_total: u64,
+    pub r_hist: Vec<f64>,
+    pub w_hist: Vec<f64>,
+    pub util_hist: Vec<f64>,
+    pub lat_hist: Vec<f64>,
+}
+
+impl MetricsData {
+    /// IO of a device by name ("sda") or path ("/dev/sda").
+    pub fn disk(&self, dev: &str) -> Option<&DiskStat> {
+        let n = dev.trim_start_matches("/dev/");
+        self.disks.iter().find(|d| d.name == n)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MetricsData {
     pub source: String,
@@ -57,6 +90,11 @@ pub struct MetricsData {
     pub net_hist: Vec<f64>,
     pub disk_hist: Vec<f64>,
     pub ifaces: Vec<IfaceStat>,
+    pub disks: Vec<DiskStat>,
+    /// display paused: samplers keep measuring but do not publish
+    pub paused: bool,
+    /// publish one sample while paused (manual refresh)
+    pub step: bool,
     /// Network/disk numbers are coarse (API rrd minute averages).
     pub coarse: bool,
 }
@@ -161,6 +199,8 @@ struct LocalSampler {
     cpu_prev: Option<(u64, u64, u64)>, // total, idle, iowait
     net_prev: HashMap<String, (u64, u64)>,
     disk_prev: Option<(u64, u64, u64, u64)>,
+    /// per device: reads, sectors read, ms reading, writes, sectors written, ms writing, io ticks
+    dev_prev: HashMap<String, [u64; 7]>,
     at: Option<Instant>,
 }
 
@@ -183,6 +223,14 @@ impl Src<'_> {
             Src::Frame(m) => m.get("netphys").map(|v| v.split_whitespace().any(|n| n == name)).unwrap_or(false),
         }
     }
+    /// All block devices (/sys/block), None when unknown (older remote sampler).
+    fn block_devices(&self) -> Option<Vec<String>> {
+        match self {
+            Src::Local => std::fs::read_dir("/sys/block").ok().map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().to_string()).collect()),
+            Src::Frame(m) => m.get("allblock").map(|v| v.split_whitespace().map(String::from).collect()),
+        }
+    }
+
     fn whole_disk(&self, name: &str) -> bool {
         match self {
             Src::Local => std::path::Path::new(&format!("/sys/block/{name}/device")).exists(),
@@ -202,7 +250,7 @@ impl Src<'_> {
 /// Script streaming one frame of /proc data per second (SSH mode).
 const REMOTE_SAMPLER: &str = "P=$(ls -d /sys/class/net/*/device 2>/dev/null | cut -d/ -f5 | tr '\\n' ' '); \
 B=$(ls -d /sys/block/*/device 2>/dev/null | cut -d/ -f4 | tr '\\n' ' '); \
-while :; do echo '@@F netphys'; echo \"$P\"; echo '@@F blockdev'; echo \"$B\"; \
+while :; do echo '@@F netphys'; echo \"$P\"; echo '@@F blockdev'; echo \"$B\"; echo '@@F allblock'; ls /sys/block | tr '\\n' ' '; echo; \
 for f in /proc/stat /proc/loadavg /proc/meminfo /proc/net/dev /proc/diskstats /proc/uptime; do echo \"@@F $f\"; cat $f; done; \
 echo '@@F /proc/spl/kstat/zfs/arcstats'; grep '^size ' /proc/spl/kstat/zfs/arcstats 2>/dev/null; \
 echo '@@F procs'; ls /proc | grep -c '^[0-9]'; echo '@@END'; sleep 1; done";
@@ -335,18 +383,49 @@ impl LocalSampler {
         }
         ifaces.sort_by(|a, b| b.physical.cmp(&a.physical).then(a.name.cmp(&b.name)));
 
-        // disks (whole devices only)
+        // disks (whole devices only) and per-device IO (all block devices, no partitions)
         let (mut rs, mut ws, mut ri, mut wi) = (0u64, 0u64, 0u64, 0u64);
+        let old_disks = data.lock().unwrap().disks.clone();
+        let all_block = src.block_devices();
+        let mut disks: Vec<DiskStat> = Vec::new();
         for line in src.read("/proc/diskstats").lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() < 14 {
                 continue;
             }
             let name = f[2];
-            if !src.whole_disk(name) {
+            let p = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+            let physical = src.whole_disk(name);
+            let listed = all_block.as_ref().map(|b| b.iter().any(|x| x == name)).unwrap_or(physical);
+            if listed && !name.starts_with("loop") && !name.starts_with("ram") {
+                let cur = [p(3), p(5), p(6), p(7), p(9), p(10), p(12)];
+                let mut st = DiskStat { name: name.to_string(), physical, r_total: cur[1] * 512, w_total: cur[4] * 512, inflight: p(11), ..Default::default() };
+                if let (Some(prev), true) = (self.dev_prev.get(name), dt > 0.0) {
+                    let d = |i: usize| cur[i].saturating_sub(prev[i]) as f64;
+                    st.r_bps = d(1) * 512.0 / dt;
+                    st.w_bps = d(4) * 512.0 / dt;
+                    st.r_iops = d(0) / dt;
+                    st.w_iops = d(3) / dt;
+                    st.r_await = if d(0) > 0.0 { d(2) / d(0) } else { 0.0 };
+                    st.w_await = if d(3) > 0.0 { d(5) / d(3) } else { 0.0 };
+                    st.util = (d(6) / (dt * 1000.0)).min(1.0);
+                }
+                self.dev_prev.insert(name.to_string(), cur);
+                if let Some(o) = old_disks.iter().find(|o| o.name == name) {
+                    st.r_hist = o.r_hist.clone();
+                    st.w_hist = o.w_hist.clone();
+                    st.util_hist = o.util_hist.clone();
+                    st.lat_hist = o.lat_hist.clone();
+                }
+                push(&mut st.r_hist, st.r_bps);
+                push(&mut st.w_hist, st.w_bps);
+                push(&mut st.util_hist, st.util);
+                push(&mut st.lat_hist, st.r_await.max(st.w_await));
+                disks.push(st);
+            }
+            if !physical {
                 continue;
             }
-            let p = |i: usize| f[i].parse::<u64>().unwrap_or(0);
             ri += p(3);
             rs += p(5);
             wi += p(7);
@@ -370,6 +449,10 @@ impl LocalSampler {
             .unwrap_or(0.0) as u64;
 
         let mut d = data.lock().unwrap();
+        if d.paused && !d.step {
+            return;
+        }
+        d.step = false;
         d.source = "local".into();
         d.ok = true;
         d.cpu = cpu;
@@ -391,6 +474,7 @@ impl LocalSampler {
         d.threads = threads;
         d.uptime = uptime;
         d.ifaces = ifaces;
+        d.disks = disks;
         d.coarse = false;
         push(&mut d.cpu_hist, cpu);
         push(&mut d.mem_hist, if mem_total > 0.0 { mem_used / mem_total } else { 0.0 });
@@ -412,6 +496,10 @@ fn sample_api(api: &Api, node: &str, data: &Arc<Mutex<MetricsData>>, last_rrd: &
         None
     };
     let mut d = data.lock().unwrap();
+    if d.paused && !d.step {
+        return;
+    }
+    d.step = false;
     d.source = format!("api:{node}");
     d.coarse = true;
     match status {
@@ -450,5 +538,44 @@ fn sample_api(api: &Api, node: &str, data: &Arc<Mutex<MetricsData>>, last_rrd: &
         }
         d.net_hist = rows.iter().map(|e| jf(e, "netin") + jf(e, "netout")).collect();
         d.disk_hist = rows.iter().map(|e| jf(e, "diskread") + jf(e, "diskwrite")).collect();
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    fn frame(reads: u64) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("/proc/stat".into(), "cpu  100 0 100 800 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0\n".into());
+        m.insert("/proc/diskstats".into(), format!("   8       0 sda {reads} 0 {} 10 5 0 40 20 0 30 30\n", reads * 8));
+        m.insert("blockdev".into(), "sda".into());
+        m.insert("allblock".into(), "sda".into());
+        m
+    }
+
+    #[test]
+    fn paused_samplers_publish_nothing_until_a_step() {
+        let data = Arc::new(Mutex::new(MetricsData::default()));
+        let mut s = LocalSampler::default();
+        s.sample_from(&data, &Src::Frame(&frame(100)));
+        std::thread::sleep(Duration::from_millis(20));
+        s.sample_from(&data, &Src::Frame(&frame(200)));
+        let before = data.lock().unwrap().disks[0].r_hist.len();
+        assert!(data.lock().unwrap().disks[0].r_iops > 0.0);
+        data.lock().unwrap().paused = true;
+        for n in 3..6 {
+            std::thread::sleep(Duration::from_millis(20));
+            s.sample_from(&data, &Src::Frame(&frame(n * 100)));
+        }
+        assert_eq!(data.lock().unwrap().disks[0].r_hist.len(), before, "paused: no new samples");
+        data.lock().unwrap().step = true;
+        std::thread::sleep(Duration::from_millis(20));
+        s.sample_from(&data, &Src::Frame(&frame(700)));
+        let d = data.lock().unwrap();
+        assert_eq!(d.disks[0].r_hist.len(), before + 1, "one step");
+        assert!(!d.step);
+        // the delta covers only the last interval (100 reads), not the paused time
+        assert_eq!(d.disks[0].r_total, 700 * 8 * 512);
     }
 }

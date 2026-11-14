@@ -1490,7 +1490,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "pxvirt-console"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1501,6 +1501,7 @@ dependencies = [
  "font8x8",
  "image",
  "libc",
+ "pxvirt-raid",
  "ratatui",
  "ratatui-image",
  "rustls",
@@ -1511,6 +1512,14 @@ dependencies = [
  "toml",
  "tungstenite",
  "ureq",
+]
+
+[[package]]
+name = "pxvirt-raid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,0 +1,99 @@
+{
+"Controllers":[
+{
+	"Command Status" : {
+		"CLI Version" : "007.3703.0000.0000 Jan 16, 2026",
+		"Operating system" : "Linux 6.6.0-11-openeuler",
+		"Controller" : 0,
+		"Status" : "Success",
+		"Description" : "None"
+	},
+	"Response Data" : {
+		"Enclosure /c0/e4 " : {
+			"Information" : {
+				"Device ID" : 4,
+				"Position" : "1",
+				"Connector Name" : "Port A & Port B x8",
+				"Enclosure Type" : "SES",
+				"Status" : "OK",
+				"FRU Part Number" : "N/A",
+				"Enclosure Serial Number" : "   500e004aaaaaaa1e",
+				"Enclosure Zoning Mode" : "N/A",
+				"Partner Device ID" : "Unavailable",
+				"Device Type" : "Enclosure",
+				"EnclLogicalID" : "0x0000000000000000"
+			},
+			"Inquiry Data" : {
+				"Vendor Identification" : "HUAWEI",
+				"Product Identification" : "Expander 12Gx16",
+				"Product Revision Level" : "128"
+			},
+			"EnclSasAddress" : [
+				{
+					"Index" : 0,
+					"SAS address" : "0x500E004AAAAAAA1E"
+				}
+			],
+			"Properties" : [
+				{
+					"EID" : 4,
+					"State" : "OK",
+					"Slots" : 16,
+					"PD" : 10,
+					"PS" : 0,
+					"Fans" : 0,
+					"TSs" : 0,
+					"Alms" : 0,
+					"SIM" : 0,
+					"Port#" : "Port A & Port B x8",
+					"ProdID" : "Expander 12Gx16",
+					"VendorSpecific" : " "
+				}
+			]
+		},
+		"Enclosure /c0/e252 " : {
+			"Information" : {
+				"Device ID" : 252,
+				"Position" : "1",
+				"Connector Name" : "N/A",
+				"Enclosure Type" : "SGPIO",
+				"Status" : "OK",
+				"FRU Part Number" : "N/A",
+				"Enclosure Serial Number" : "N/A",
+				"Enclosure Zoning Mode" : "N/A",
+				"Partner Device ID" : "Unavailable",
+				"Device Type" : "Backplane",
+				"EnclLogicalID" : "0x0000000000000000"
+			},
+			"Inquiry Data" : {
+				"Vendor Identification" : "AVAGO",
+				"Product Identification" : "SGPIO",
+				"Product Revision Level" : "N/A"
+			},
+			"EnclSasAddress" : [
+				{
+					"Index" : 0,
+					"SAS address" : "0x500E004AAAAAAA1E"
+				}
+			],
+			"Properties" : [
+				{
+					"EID" : 252,
+					"State" : "OK",
+					"Slots" : 8,
+					"PD" : 0,
+					"PS" : 0,
+					"Fans" : 0,
+					"TSs" : 0,
+					"Alms" : 0,
+					"SIM" : 1,
+					"Port#" : "-",
+					"ProdID" : "SGPIO",
+					"VendorSpecific" : " "
+				}
+			]
+		}
+	}
+}
+]
+}

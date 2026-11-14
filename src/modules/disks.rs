@@ -26,7 +26,20 @@ pub fn views() -> Vec<Box<dyn View>> {
         Box::new(Lvm::default()),
         Box::new(Zfs::default()),
         Box::new(Ceph::default()),
+        Box::new(super::diskio::DiskIo::default()),
+        Box::new(super::netstorage::NetStorage::default()),
+        Box::new(super::raid::HwRaid::default()),
     ]
+}
+
+#[cfg(test)]
+mod zfs_tests {
+    #[test]
+    fn zpool_iostat_last_sample() {
+        let out = "rpool\t100\t200\t1\t2\t1000\t2000\t500000\t800000\t1\t1\t-\t-\t-\t-\t-\t-\nrpool\t100\t200\t10\t20\t40960\t81920\t2000000\t4000000\t1\t1\t-\t-\t-\t-\t-\t-\n";
+        let m = super::parse_zpool_iostat(out);
+        assert_eq!(m["rpool"], [10.0, 20.0, 40960.0, 81920.0, 2.0, 4.0]);
+    }
 }
 
 fn not_configured(err: &str) -> bool {
@@ -93,7 +106,8 @@ impl View for Physical {
         Some(&mut self.table)
     }
 
-    fn draw_list(&mut self, f: &mut Frame, area: Rect, _ctx: &Ctx, focused: bool) {
+    fn draw_list(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx, focused: bool) {
+        let m = ctx.metrics.lock().unwrap().clone();
         if !self.table.multi {
             self.table.multi = true;
         }
@@ -112,32 +126,36 @@ impl View for Physical {
                     _ => Style::default(),
                 };
                 let used = js(d, "used");
-                Row::new(js(d, "devpath"))
+                let row = Row::new(js(d, "devpath"))
                     .c(js(d, "devpath"))
                     .c(js(d, "type"))
                     .c(fmt_bytes(jf(d, "size")))
                     .c(js(d, "model"))
+                    .cs(health.clone(), status_style(&health));
+                super::diskio::cells(row, m.disk(&js(d, "devpath")))
                     .c(js(d, "serial"))
-                    .cs(health.clone(), status_style(&health))
                     .cs(wear_s, wear_st)
                     .cs(if used.is_empty() { "unused".into() } else { used.clone() }, if used.is_empty() { style_good() } else { Style::default() })
             })
             .collect();
-        let cols = [
+        let mut cols = vec![
             col("Device", Constraint::Length(14)),
             col("Type", Constraint::Length(5)),
             col("Size", Constraint::Length(7)),
             col("Model", Constraint::Min(14)),
-            col("Serial", Constraint::Length(16)),
             col("Health", Constraint::Length(7)),
-            col("Wearout", Constraint::Length(7)),
-            col("Usage", Constraint::Length(12)),
         ];
+        cols.extend(super::diskio::cols());
+        cols.extend([col("Serial", Constraint::Length(16)), col("Wearout", Constraint::Length(7)), col("Usage", Constraint::Length(12))]);
         self.table.draw(f, area, "Physical disks", &cols, &rows, focused, loading_or_error(&self.data.error, self.data.loading()));
     }
 
-    fn draw_detail(&mut self, f: &mut Frame, area: Rect, _ctx: &Ctx, focused: bool) {
+    fn draw_detail(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx, focused: bool) {
         let mut kv = Kv::new();
+        let io = self.sel().and_then(|d| ctx.metrics.lock().unwrap().disk(&js(d, "devpath")).cloned());
+        if let Some(st) = &io {
+            super::diskio::detail(&mut kv, st);
+        }
         if let Some(d) = self.sel() {
             let dev = js(d, "devpath");
             kv.add("Device", dev.clone());
@@ -183,7 +201,11 @@ impl View for Physical {
                 }
             }
         }
-        draw_lines(f, area, "Details", focused, kv.lines(), self.scroll);
+        let mut lines = kv.lines();
+        if let Some(st) = &io {
+            lines.extend(super::diskio::graphs(st, area.width as usize));
+        }
+        draw_lines(f, area, "Details", focused, lines, self.scroll);
     }
 
     fn scroll_detail(&mut self, d: i32) {
@@ -199,7 +221,7 @@ impl View for Physical {
         let unused = self.sel().map(|d| js(d, "used").is_empty()).unwrap_or(false);
         vec![
             item('s', "Show full SMART report").require(ctx.need_node_priv("Sys.Audit")),
-            item('G', "Initialize disk with GPT").require(m.clone()).disabled_if(!unused, "disk is in use"),
+            item('P', "Initialize disk with GPT").require(m.clone()).disabled_if(!unused, "disk is in use"),
             item('W', "Wipe disk").require(m.clone()).disabled_if(self.sel().is_none(), "no disk"),
             item('z', "Create ZFS pool (marked disks)").require(m.clone()),
             item('t', "Create LVM-thin pool").require(m.clone()).disabled_if(!unused, "disk is in use"),
@@ -233,7 +255,7 @@ impl View for Physical {
                     Ok(ActionOutcome::Text(format!("SMART {d2}"), text))
                 });
             }
-            'G' => ctx.popup(Popup::confirm("Initialize GPT", &format!("gpt:{dev}"), vec![format!("Write a new GPT partition table to {dev}?")], true)),
+            'P' => ctx.popup(Popup::confirm("Initialize GPT", &format!("gpt:{dev}"), vec![format!("Write a new GPT partition table to {dev}?")], true)),
             'W' => ctx.popup(Popup::confirm_typed(
                 "Wipe disk",
                 &format!("wipe:{dev}"),
@@ -629,8 +651,24 @@ struct Zfs {
     detail: HashMap<String, Loader<Value>>,
     datasets: Loader<Vec<Vec<String>>>,
     arc: Loader<HashMap<String, f64>>,
+    /// pool -> read ops/s, write ops/s, read B/s, write B/s, read wait ms, write wait ms
+    iostat: Loader<HashMap<String, [f64; 6]>>,
     table: Table,
     scroll: u16,
+}
+
+/// `zpool iostat -Hpl 1 2`: the last line of each pool is the 1 s interval.
+fn parse_zpool_iostat(out: &str) -> HashMap<String, [f64; 6]> {
+    let mut m = HashMap::new();
+    for l in out.lines() {
+        let f: Vec<&str> = l.split('\t').collect();
+        if f.len() < 11 {
+            continue;
+        }
+        let n = |i: usize| f[i].trim().parse::<f64>().unwrap_or(0.0);
+        m.insert(f[0].to_string(), [n(3), n(4), n(5), n(6), n(7) / 1e6, n(8) / 1e6]);
+    }
+    m
 }
 
 fn vdev_lines(v: &Value, depth: usize, kv: &mut Kv) {
@@ -654,6 +692,8 @@ impl View for Zfs {
         self.pools.load(move || Ok(jarr(&api.get(&format!("/nodes/{node}/disks/zfs"))?)));
         if let Some(exec) = ctx.exec() {
             let e2 = exec.clone();
+            let e3 = exec.clone();
+            self.iostat.load(move || Ok(parse_zpool_iostat(&e3.output("zpool", &["iostat", "-Hpl", "1", "2"])?)));
             self.datasets.load(move || {
                 let out = exec.output("zfs", &["list", "-Hp", "-o", "name,used,avail,refer,mountpoint,compressratio,type", "-t", "filesystem,volume"])?;
                 Ok(out.lines().map(|l| l.split('\t').map(|s| s.to_string()).collect()).collect())
@@ -714,14 +754,22 @@ impl View for Zfs {
                 let (size, alloc) = (jf(p, "size"), jf(p, "alloc"));
                 let frac = if size > 0.0 { alloc / size } else { 0.0 };
                 let health = js(p, "health");
-                Row::new(js(p, "name"))
+                let io = self.iostat.data.as_ref().and_then(|m| m.get(&js(p, "name"))).copied();
+                let row = Row::new(js(p, "name"))
                     .cs(js(p, "name"), Style::default().fg(ACCENT))
                     .cs(health.clone(), status_style(if health == "ONLINE" { "ok" } else { "error" }))
                     .c(fmt_bytes(size))
                     .cs(format!("{} {:.0}%", bar(frac, 10), frac * 100.0), usage_style(frac))
                     .c(fmt_bytes(jf(p, "free")))
                     .c(format!("{}%", js(p, "frag")))
-                    .c(format!("{}x", js(p, "dedup")))
+                    .c(format!("{}x", js(p, "dedup")));
+                match io {
+                    Some(v) => {
+                        let lat = v[4].max(v[5]);
+                        row.c(crate::util::fmt_rate(v[2])).c(crate::util::fmt_rate(v[3])).c(format!("{:.0}", v[0] + v[1])).cs(super::diskio::ms(lat), super::diskio::lat_style(lat))
+                    }
+                    None => row.c("").c("").c("").c(""),
+                }
             })
             .collect();
         let cols = [
@@ -732,6 +780,10 @@ impl View for Zfs {
             col("Free", Constraint::Length(8)),
             col("Frag", Constraint::Length(5)),
             col("Dedup", Constraint::Length(6)),
+            col("Read", Constraint::Length(9)),
+            col("Write", Constraint::Length(9)),
+            col("IOPS", Constraint::Length(6)),
+            col("Latency", Constraint::Length(7)),
         ];
         self.table.draw(f, area, "ZFS pools", &cols, &rows, focused, loading_or_error(&self.pools.error, self.pools.loading()));
     }
@@ -739,6 +791,11 @@ impl View for Zfs {
     fn draw_detail(&mut self, f: &mut Frame, area: Rect, _ctx: &Ctx, focused: bool) {
         let mut kv = Kv::new();
         if let Some(p) = self.table.selected() {
+            if let Some(v) = self.iostat.data.as_ref().and_then(|m| m.get(p)) {
+                kv.section("IO");
+                kv.add("Read", format!("{}  {:.0} IOPS  {} {}", crate::util::fmt_rate(v[2]), v[0], tr("latency"), super::diskio::ms(v[4])));
+                kv.add("Write", format!("{}  {:.0} IOPS  {} {}", crate::util::fmt_rate(v[3]), v[1], tr("latency"), super::diskio::ms(v[5])));
+            }
             if let Some(d) = self.detail.get(p).and_then(|l| l.data.as_ref()) {
                 kv.status("State", js(d, "state"));
                 for k in ["status", "action", "scan", "errors"] {

@@ -1,0 +1,17 @@
+SES|/sys/class/enclosure/0:0:4:0|0x500e004aaaaaaa1e
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 00 |0|0|0|-|not installed
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 01 |1|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 02 |2|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 03 |3|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 04 |4|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 05 |5|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 06 |6|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 07 |7|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 08 |8|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 09 |9|0|0|-|not installed
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 10 |10|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 11 |11|0|0|-|OK
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 12 |12|0|0|-|not installed
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 13 |13|0|0|-|not installed
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 14 |14|0|0|-|not installed
+SLOT|/sys/class/enclosure/0:0:4:0|/sys/class/enclosure/0:0:4:0/Array Device 15 |15|0|0|-|not installed

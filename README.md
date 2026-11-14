@@ -14,7 +14,7 @@ your workstation to manage a remote node over SSH or the PVE API.
   processes, PCI/USB devices (driver bind/unbind, reset, SR-IOV), hardware info, updates, PVE users & ACLs, certificates, power actions
 - **Network**: management network (changes are reverted automatically unless confirmed within 60 s), interfaces / bridges / bonds / VLANs,
   live traffic, tools (ping, traceroute, …), routes, firewall
-- **Disks**: disks, partitions, LVM, ZFS, Ceph
+- **Disks**: disks, partitions, LVM, ZFS, Ceph, hardware RAID / HBA / NVMe (StorCLI, PERCCLI, ssacli, arcconf, sas2/3ircu, hiraidadm, Areca, HighPoint, Dell BOSS mvcli, tw_cli, nvme-cli)
 - **Services & Logs**: systemd services, journal, PVE tasks
 - **PVE**: VMs and containers (start/stop/create, full hardware and options editor), storage browser (upload ISOs, templates and OVAs from your computer, or let the node download them from a URL), cluster nodes
 - **Graphical VM console**: VNC rendered with SDL2/KMSDRM on tty1, or as Kitty/Sixel/half-block graphics in a terminal, with mouse support

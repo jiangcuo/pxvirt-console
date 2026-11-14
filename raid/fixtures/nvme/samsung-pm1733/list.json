@@ -1,0 +1,15 @@
+{
+  "Devices":[
+    {
+      "NameSpace":1,
+      "DevicePath":"/dev/nvme0n1",
+      "Firmware":"EPK9CJ5Q",
+      "ModelNumber":"SAMSUNG MZPLJ1T6HBJR-0007C",
+      "SerialNumber":"S5LCNC0RC00530",
+      "UsedBytes":1600321314816,
+      "MaximumLBA":3125627568,
+      "PhysicalSize":1600321314816,
+      "SectorSize":512
+    }
+  ]
+}

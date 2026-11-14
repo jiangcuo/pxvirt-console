@@ -1,0 +1,24 @@
+{
+"Controllers":[
+{
+	"Command Status" : {
+		"CLI Version" : "007.3703.0000.0000 Jan 16, 2026",
+		"Operating system" : "Linux 6.6.0-11-openeuler",
+		"Controller" : 0,
+		"Status" : "Success",
+		"Description" : "None"
+	},
+	"Response Data" : {
+		"VD Operation Status" : [
+			{
+				"VD" : 239,
+				"Operation" : "CC",
+				"Progress%" : "-",
+				"Status" : "Not in progress",
+				"Estimated Time Left" : "-"
+			}
+		]
+	}
+}
+]
+}

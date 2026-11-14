@@ -310,11 +310,11 @@ impl View for Memory {
         let r = ctx.need_root().and(ctx.need_exec("Sys.Modify").map(|_| ()));
         let has_arc = self.data.data.as_ref().map(|d| !d.arc().is_empty()).unwrap_or(false);
         vec![
-            item('a', "Set ZFS ARC limit").require(r.clone()).disabled_if(!has_arc, "ZFS not loaded"),
+            item('z', "Set ZFS ARC limit").require(r.clone()).disabled_if(!has_arc, "ZFS not loaded"),
             item('w', "Set swappiness").require(r.clone()),
-            item('h', "Set huge pages").require(r.clone()),
+            item('p', "Set huge pages").require(r.clone()),
             item('T', "Transparent huge pages mode").require(r.clone()),
-            item('k', "Start / stop KSM").require(r.clone()),
+            item('K', "Start / stop KSM").require(r.clone()),
             item('d', "Drop page cache").require(r.clone()),
             item('S', "Flush swap (swapoff -a; swapon -a)").require(r),
         ]
@@ -333,7 +333,7 @@ impl View for Memory {
         let d = self.data.data.as_ref();
         let file = |p: &str| d.map(|d| d.file(p).trim().to_string()).unwrap_or_default();
         match key {
-            'a' => {
+            'z' => {
                 let total = d.map(|d| d.meminfo().get("MemTotal").cloned().unwrap_or(0.0)).unwrap_or(0.0);
                 let cur = file("/sys/module/zfs/parameters/zfs_arc_max").parse::<f64>().unwrap_or(0.0);
                 let gib = if cur > 0.0 { format!("{:.0}", cur / 1073741824.0) } else { String::new() };
@@ -355,7 +355,7 @@ impl View for Memory {
                     form::check("persist", "Keep after reboot", true),
                 ],
             ))),
-            'h' => {
+            'p' => {
                 let mut opts = Vec::new();
                 if let Some(d) = d {
                     let mut ks: Vec<&String> = d.files.keys().filter(|k| k.ends_with("/nr_hugepages")).collect();
@@ -380,7 +380,7 @@ impl View for Memory {
                 )));
             }
             'T' => ctx.popup(Popup::menu("Transparent huge pages", "thp", vec![item('1', "always"), item('2', "madvise"), item('3', "never")])),
-            'k' => {
+            'K' => {
                 let run = file("/sys/kernel/mm/ksm/run");
                 let to = if run == "1" { "0" } else { "1" };
                 self.write(ctx, "/sys/kernel/mm/ksm/run", to, if to == "1" { "Start KSM" } else { "Stop KSM" });

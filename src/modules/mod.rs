@@ -1,15 +1,19 @@
 //! Top-level modules (System, Network, Disks, Services & Logs, PVE) and the View trait.
 
+pub mod conns;
 pub mod disks;
+pub mod diskio;
 pub mod guestcfg;
 pub mod hardware;
 pub mod memory;
 pub mod netmgmt;
+pub mod netstorage;
 pub mod network;
 pub mod overview;
 pub mod pve;
 pub mod processes;
 pub mod pve_create;
+pub mod raid;
 pub mod services;
 pub mod system;
 pub mod updates;
@@ -82,6 +86,11 @@ pub trait View {
     }
 
     fn scroll_detail(&mut self, _delta: i32) {}
+
+    /// Left click in the details pane (screen coordinates); true = handled.
+    fn on_click(&mut self, _x: u16, _y: u16, _ctx: &mut Ctx) -> bool {
+        false
+    }
 
     /// Node context changed: drop cached data.
     fn reset(&mut self) {}

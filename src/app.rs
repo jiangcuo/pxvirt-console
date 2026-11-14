@@ -363,7 +363,8 @@ impl App {
         for m in 0..self.modules.len() {
             for v in 0..self.modules[m].views.len() {
                 self.goto(m, v);
-                settle(self, 3000);
+                // the RAID scan runs many vendor commands
+                settle(self, if self.modules[m].views[v].title() == "Hardware RAID" { 20000 } else { 3000 });
                 let name = format!("{}_{}_{}", m + 1, v + 1, self.modules[m].views[v].title().replace([' ', '/', '&'], ""));
                 dump(self, &name)?;
                 // context menu
@@ -383,6 +384,20 @@ impl App {
                     self.popups.clear();
                     self.on_key(KeyEvent::from(KeyCode::Esc));
                     settle(self, 300);
+                }
+                // hardware RAID: menus of a controller, a virtual drive and a physical drive
+                if self.modules[m].views[v].title() == "Hardware RAID" {
+                    use crossterm::event::{KeyCode, KeyEvent};
+                    for (i, steps) in [0usize, 1, 4].iter().enumerate() {
+                        for _ in 0..*steps {
+                            self.on_key(KeyEvent::from(KeyCode::Down));
+                        }
+                        settle(self, 200);
+                        dump(self, &format!("{name}_sel{i}"))?;
+                        self.open_context_menu();
+                        dump(self, &format!("{name}_sel{i}_menu"))?;
+                        self.popups.clear();
+                    }
                 }
                 // guest configuration page of the first guest: page, menu, add menu, first edit form
                 if self.modules[m].views[v].title() == "Guests" && self.modules[m].views[v].table().map(|t| t.selected().is_some()).unwrap_or(false) {
@@ -408,6 +423,19 @@ impl App {
                     }
                     self.on_key(KeyEvent::from(KeyCode::Esc));
                     settle(self, 300);
+                }
+                // create VM: node picker (clusters) or the form
+                if self.modules[m].views[v].title() == "Guests" {
+                    use crossterm::event::{KeyCode, KeyEvent};
+                    self.on_key(KeyEvent::from(KeyCode::Char('N')));
+                    settle(self, 3000);
+                    dump(self, &format!("{name}_create"))?;
+                    if self.popups.last().map(|p| matches!(p.0, Popup::Menu(_))).unwrap_or(false) {
+                        self.on_key(KeyEvent::from(KeyCode::Char('1')));
+                        settle(self, 4000);
+                        dump(self, &format!("{name}_create_form"))?;
+                    }
+                    self.popups.clear();
                 }
             }
         }
@@ -727,7 +755,7 @@ impl App {
 
         // alerts
         self.alerts.poll();
-        if self.alerts.stale(Duration::from_secs(30)) {
+        if self.auto_refresh && self.alerts.stale(Duration::from_secs(30)) {
             let api = self.ctx.api.clone();
             let node = self.ctx.node.clone();
             let exec = self.ctx.exec();
@@ -749,6 +777,13 @@ impl App {
                 self.process_cmds(origin);
             }
         }
+    }
+
+    /// F7: pause / resume all refreshing, including the live samplers (IO, traffic, status bar).
+    fn toggle_pause(&mut self) {
+        self.auto_refresh = !self.auto_refresh;
+        self.ctx.metrics.lock().unwrap().paused = !self.auto_refresh;
+        self.toast(tr(if self.auto_refresh { "Refreshing resumed" } else { "Display paused (r = refresh once, F7 = resume)" }).to_string(), false);
     }
 
     fn refresh_current(&mut self, force: bool) {
@@ -886,6 +921,7 @@ impl App {
             KeyCode::F(6) => return self.open_node_picker(),
             KeyCode::F(8) => return self.goto_title("Tasks"),
             KeyCode::F(10) => return self.open_shell(),
+            KeyCode::F(7) => return self.toggle_pause(),
             KeyCode::Char('r') if ctrl => return self.refresh_current(true),
             // Tab moves between the list and the details (modules are F1-F5)
             KeyCode::Tab | KeyCode::BackTab => {
@@ -1009,10 +1045,10 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('r') => self.refresh_current(true),
-            KeyCode::Char('a') => {
-                self.auto_refresh = !self.auto_refresh;
-                self.toast(format!("auto-refresh {}", if self.auto_refresh { "on" } else { "off" }), false);
+            KeyCode::Char('r') => {
+                // while paused: one new snapshot of the live data too
+                self.ctx.metrics.lock().unwrap().step = true;
+                self.refresh_current(true)
             }
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 // views without a table scroll their main pane
@@ -1140,7 +1176,13 @@ impl App {
                 }
             }
             Some(Hit::More) if left => self.open_context_menu(),
-            Some(Hit::Detail) => self.focus = Focus::Detail,
+            Some(Hit::Detail) => {
+                if left && self.modules[cm].views[cv].on_click(mx, my, &mut self.ctx) {
+                    self.process_cmds(Origin::View(cm, cv));
+                } else {
+                    self.focus = Focus::Detail;
+                }
+            }
             Some(Hit::List) => {
                 self.focus = Focus::List;
                 let on_row = self.modules[cm].views[cv].table().map(|t| t.click(mx, my)).unwrap_or(false);
@@ -1190,7 +1232,7 @@ impl App {
         let items: Vec<MenuItem> = vec![
             item('n', "Switch node (F6)").disabled_if(self.ctx.nodes.len() < 2, "single node"),
             item('r', "Refresh all"),
-            item('a', "Toggle auto-refresh"),
+            item('a', "Pause / resume refreshing (F7)"),
             item('t', "Task center (F8)"),
             item('A', "Alerts"),
             item('L', "Language").disabled_if(!i18n::cjk_capable(), "tty: English only"),
@@ -1288,8 +1330,7 @@ impl App {
                 self.refresh_current(true);
             }
             'a' => {
-                self.auto_refresh = !self.auto_refresh;
-                self.toast(format!("auto-refresh {}", if self.auto_refresh { "on" } else { "off" }), false);
+                self.toggle_pause();
             }
             't' => self.goto_title("Tasks"),
             'A' => {
@@ -1468,7 +1509,7 @@ impl App {
                 right.push(Span::styled(" ", bar));
             }
             if !self.auto_refresh {
-                right.push(Span::styled(" manual ", Style::default().bg(Color::Yellow).fg(Color::Black)));
+                right.push(Span::styled(format!(" ⏸ {} · F7 ", tr("paused")), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
                 right.push(Span::styled(" ", bar));
             }
             right.push(Span::styled(format!("{}  ", self.ctx.session.user), bar));
@@ -1736,6 +1777,8 @@ fn collect_alerts(api: &Api, node: &str, exec: Option<crate::exec::Exec>) -> Vec
         }
     }
     if let Some(exec) = exec {
+        // hardware RAID / NVMe health (full scan at most every 5 minutes)
+        out.extend(crate::raidhost::problems_cached(&exec));
         if let Ok(o) = exec.output("systemctl", &["--failed", "--no-legend", "--plain", "--type=service"]) {
             for l in o.lines() {
                 if let Some(u) = l.split_whitespace().next() {
@@ -1758,7 +1801,8 @@ Global keys
   letters             direct actions (shown in the menu); UPPERCASE = forced/dangerous variant
   Space               mark multiple rows (batch actions)
   /                   filter the list (each page remembers its filter), Esc clears
-  r / Ctrl-R          refresh, a = toggle auto-refresh
+  r / Ctrl-R          refresh (once, also while paused)
+  F7                  pause / resume all refreshing, live graphs included
   F6                  switch node (cluster)
   F8                  task center
   F10                 shell (root@pam)
@@ -1787,7 +1831,8 @@ const HELP_ZH: &str = "\
   字母                直接执行菜单里的操作；大写 = 强制/危险版本
   空格                多选（批量操作）
   /                   过滤列表（每个页面单独记住），Esc 清除
-  r / Ctrl-R          刷新，a = 自动刷新开关
+  r / Ctrl-R          刷新一次（暂停时也可用）
+  F7                  暂停 / 恢复全部刷新，包括实时曲线
   F6                  切换节点（集群）
   F8                  任务中心
   F10                 Shell（仅 root@pam）

@@ -1,0 +1,20 @@
+[
+  {
+    "HostNQN":"nqn.2014-08.org.nvmexpress:uuid:3cdc9dc0-6012-b135-ea11-d1b73eef1588",
+    "HostID":"6a855814-a61c-407c-a60a-dab7678b2c60",
+    "Subsystems":[
+      {
+        "Name":"nvme-subsys0",
+        "NQN":"nqn.1994-11.com.samsung:nvme:PM1733:HHHL:S5LCNC0RC00530",
+        "Paths":[
+          {
+            "Name":"nvme0",
+            "Transport":"pcie",
+            "Address":"0000:86:00.0",
+            "State":"live"
+          }
+        ]
+      }
+    ]
+  }
+]

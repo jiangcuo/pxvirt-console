@@ -12,7 +12,7 @@ PXVIRT / Proxmox VE 的文本界面节点管理控制台，类似 VMware ESXi �
 - **系统**：概览（软件版本、硬件、CPU/内存/存储、进程排行）、内存（ZFS ARC、Swap、大页）、进程、
   PCI/USB 设备（驱动绑定/解绑、重置、SR-IOV）、硬件信息、更新、PVE 用户与权限、证书、电源操作
 - **网络**：管理网络（修改后 60 秒内不确认会自动回滚）、网卡/网桥/Bond/VLAN、实时流量、诊断工具（ping、traceroute 等）、路由、防火墙
-- **磁盘**：磁盘、分区、LVM、ZFS、Ceph
+- **磁盘**：磁盘、分区、LVM、ZFS、Ceph、硬件 RAID / HBA / NVMe（StorCLI、PERCCLI、ssacli、arcconf、sas2/3ircu、hiraidadm、Areca、HighPoint、Dell BOSS mvcli、tw_cli、nvme-cli）
 - **服务日志**：systemd 服务、journal 日志、PVE 任务
 - **PVE**：虚拟机和容器（启动、停止、创建，完整的硬件和选项编辑）、存储浏览（从本机上传 ISO、模板和 OVA，或让节点从 URL 下载）、集群节点
 - **图形虚拟机控制台**：通过 VNC 连接；tty1 上用 SDL2/KMSDRM 显示，终端里用 Kitty/Sixel/半块字符显示，支持鼠标
