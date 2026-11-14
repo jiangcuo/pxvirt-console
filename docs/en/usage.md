@@ -54,9 +54,22 @@ VM. The wheel scrolls lists and details.
 F7 freezes everything: page reloads, the live sampler (IO, traffic, status bar) and the alert check. The header shows
 `⏸ paused · F7`. `r` takes one new snapshot while paused.
 
-## Permissions
+## Login and permissions
 
-You log in with a PVE account (TFA supported). Actions are shown according to the account's PVE privileges; the menu
+| Started as | Login |
+|---|---|
+| tty1 / serial console | PVE login screen (anyone can walk up to the console) |
+| root in a terminal on the node (`sudo pxvirt-console`) | automatic, as `root@pam` |
+| `--ssh root@node` | automatic, as `root@pam` |
+| `--ssh user@node` (not root), `--remote`, non-root terminal | PVE login screen |
+
+The process itself runs as root on the console (like getty or a display manager); the login decides what the person
+in front of it may do. In a terminal or over SSH as root the operating system has already authenticated the operator,
+so the console logs in as `root@pam` without asking. Automatic sessions have no login screen to return to: log out,
+the idle timeout and leaving the shell quit the program. The audit log records the origin
+(`login (terminal, sudo by lucas, automatic)`).
+
+On the login screen you log in with a PVE account (TFA supported). Actions are shown according to the account's PVE privileges; the menu
 explains missing ones. Host actions (RAID, connections, services, ...) need `root@pam` or the matching node privilege
 and local / SSH access. If the PVE API is down, `root@pam` can log in with the local password into a rescue mode
 (PVE via `pvesh`, host tools only).

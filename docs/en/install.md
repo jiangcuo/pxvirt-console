@@ -21,7 +21,7 @@ xattr -d com.apple.quarantine pxvirt-console
 | Mode | Start | What works |
 |---|---|---|
 | Console | `pxvirt-console.service` on tty1 | Everything. Replaces the tty1 login; cannot be quit, only logged out (also after the idle timeout) |
-| Local | `sudo pxvirt-console` in a terminal on the node | Everything |
+| Local | `sudo pxvirt-console` in a terminal on the node | Everything; logs in as `root@pam` automatically |
 | SSH | `pxvirt-console --ssh root@node[:port]` | Everything. One SSH master connection carries the API (port forward), host commands, shells, consoles and live metrics. SSH user `root` logs in as `root@pam` automatically |
 | API | `pxvirt-console --remote node[:port]` | PVE API only. The certificate fingerprint is confirmed on first contact. Pages that need host commands (IO, RAID, connections, ...) are hidden |
 

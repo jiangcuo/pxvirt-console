@@ -130,7 +130,7 @@ fn main() -> Result<()> {
             let _ = AUDIT_EXEC.set(c.exec());
             let t = app::SshTarget { target: c.target.clone(), label: c.label(), node: c.node.clone(), api_port: c.api_port, user: c.user.clone() };
             let mut app = App::new(cfg, None, Some(t));
-            app.ssh_auto_login()?;
+            app.auto_login()?;
             let r = app.debug_dump(&dir, &[(160, 40), (110, 32)]);
             c.close();
             return r;
@@ -198,10 +198,9 @@ fn main() -> Result<()> {
             user: c.user.clone(),
         });
         let mut app = App::new(cfg, args.remote, ssh);
-        if conn.is_some() {
-            if let Err(e) = app.ssh_auto_login() {
-                app.ctx.toast_err(format!("auto login failed: {e:#}"));
-            }
+        // root over SSH or root in a terminal: no login screen (tty1 / serial / --remote keep it)
+        if let Err(e) = app.auto_login() {
+            app.ctx.toast_err(format!("auto login failed: {e:#}"));
         }
         run_app(&mut terminal, &mut app)
     };

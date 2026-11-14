@@ -110,6 +110,10 @@ pub struct App {
     hits: Vec<(Rect, Hit)>,
     last_click: Option<(Instant, u16, u16)>,
     ssh: Option<SshTarget>,
+    /// logged in automatically (root in a terminal or over SSH): logging out quits
+    auto_session: bool,
+    /// how the session was started, for the audit log ("terminal, sudo by x", "ssh root@y")
+    login_origin: String,
 }
 
 impl App {
@@ -191,19 +195,51 @@ impl App {
             hits: Vec::new(),
             last_click: None,
             ssh,
+            auto_session: false,
+            login_origin: String::new(),
         }
     }
 
     /// SSH mode: connected as root -> create a root@pam ticket on the node, skip the login form.
-    pub fn ssh_auto_login(&mut self) -> anyhow::Result<()> {
-        let Some(t) = &self.ssh else { return Ok(()) };
-        if t.user != "root" {
+    /// The operator was already authenticated by the OS: root over SSH, or root in a terminal
+    /// on the node (sudo). Log in as root@pam without asking. The system console (tty1, serial)
+    /// and API-only mode always use the login screen.
+    pub fn auto_login(&mut self) -> anyhow::Result<()> {
+        if let Some((user, target)) = self.ssh.as_ref().map(|t| (t.user.clone(), t.target.clone())) {
+            if user != "root" {
+                return Ok(());
+            }
+            let exec = crate::exec::Exec::Ssh(target.clone());
+            let auth = api::forge_root_auth_with(&exec)?;
+            self.ctx.api.set_auth(auth);
+            let init = login::init_session(self.ctx.api.clone(), false)?;
+            self.auto_session = true;
+            self.login_origin = format!("ssh {target}");
+            self.start_session(init);
             return Ok(());
         }
-        let exec = crate::exec::Exec::Ssh(t.target.clone());
-        let auth = api::forge_root_auth_with(&exec)?;
-        self.ctx.api.set_auth(auth);
-        let init = login::init_session(self.ctx.api.clone(), false)?;
+        if self.remote.is_some() || !crate::util::is_root_process() || crate::util::on_system_console() {
+            return Ok(());
+        }
+        let who = std::env::var("SUDO_USER").map(|u| format!("terminal, sudo by {u}")).unwrap_or_else(|_| "terminal".into());
+        // PVE API: a locally signed ticket; API down: rescue mode through pvesh
+        let init = match api::forge_root_auth() {
+            Ok(auth) => {
+                self.ctx.api.set_auth(auth);
+                login::init_session(self.ctx.api.clone(), false)
+            }
+            Err(e) => Err(e),
+        };
+        let init = match init {
+            Ok(i) => i,
+            Err(_) => {
+                let api = Arc::new(Api::pvesh());
+                self.ctx.api = api.clone();
+                login::init_session(api, true)?
+            }
+        };
+        self.auto_session = true;
+        self.login_origin = who;
         self.start_session(init);
         Ok(())
     }
@@ -490,7 +526,14 @@ impl App {
         self.start_metrics();
         self.fetch_arch();
         self.alerts.clear();
-        crate::audit(&self.ctx.session.user, &self.ctx.node, if self.ctx.session.rescue { "login (rescue mode)" } else { "login" });
+        let mut what = String::from("login");
+        if self.ctx.session.rescue {
+            what.push_str(" (rescue mode)");
+        }
+        if !self.login_origin.is_empty() {
+            what.push_str(&format!(" ({}, automatic)", self.login_origin));
+        }
+        crate::audit(&self.ctx.session.user, &self.ctx.node, &what);
         if self.ctx.session.rescue {
             self.toast(tr("RESCUE MODE: PVE API unreachable, local root access only").to_string(), true);
         }
@@ -530,8 +573,8 @@ impl App {
         if self.screen == Screen::Main {
             crate::audit(&self.ctx.session.user, &self.ctx.node, "logout");
         }
-        if self.ssh.is_some() {
-            // SSH mode: logging out = disconnecting
+        if self.ssh.is_some() || self.auto_session {
+            // automatic sessions have no login screen to go back to: logging out = quitting
             self.should_exit = true;
             return;
         }
@@ -1300,7 +1343,7 @@ impl App {
             prog,
             args,
             env: vec![("TMOUT".into(), self.ctx.cfg.idle_timeout_secs.to_string())],
-            logout_after: self.ssh.is_none(),
+            logout_after: self.ssh.is_none() && !self.auto_session,
             pause_after: false,
         });
         crate::audit(&self.ctx.session.user, &self.ctx.node, "enter shell");
@@ -1359,8 +1402,8 @@ impl App {
                 self.popups.push((Popup::text("About", &text), Origin::Global));
             }
             'o' => {
-                if self.ssh.is_some() {
-                    // SSH mode: logging out disconnects, so ask first
+                if self.ssh.is_some() || self.auto_session {
+                    // automatic sessions: logging out quits, so ask first
                     self.confirm_quit = true;
                 } else {
                     self.logout();

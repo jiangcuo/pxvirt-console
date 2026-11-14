@@ -21,7 +21,7 @@ xattr -d com.apple.quarantine pxvirt-console
 | 模式 | 启动方式 | 可用功能 |
 |---|---|---|
 | 控制台 | tty1 上的 `pxvirt-console.service` | 全部功能。替换 tty1 登录界面；不能退出，只能注销（空闲超时也会自动注销） |
-| 本机 | 在节点的终端里运行 `sudo pxvirt-console` | 全部功能 |
+| 本机 | 在节点的终端里运行 `sudo pxvirt-console` | 全部功能；自动以 `root@pam` 登录 |
 | SSH | `pxvirt-console --ssh root@节点[:端口]` | 全部功能。一条 SSH 主连接同时承载 API（端口转发）、主机命令、Shell、控制台和实时监控；SSH 用户是 root 时自动以 `root@pam` 登录 |
 | API | `pxvirt-console --remote 节点[:端口]` | 只用 PVE API；首次连接确认证书指纹；需要主机命令的页面（IO、RAID、连接等）会隐藏 |
 
