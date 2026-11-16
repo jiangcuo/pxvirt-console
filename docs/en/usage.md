@@ -7,7 +7,7 @@
 ```
  PXVIRT │ node · cluster                          SSH / remote   user   node arch   time
   F1 System   F2 Network   F3 Disks   F4 Services & Logs   F5 PVE        ← modules
-  1 Overview  2 Memory  3 Processes  ...                                 ← pages
+  1 Overview  2 Health  3 Memory  ...                                    ← pages
  ┌ list ───────────────────────────┐ ┌ details ───────────────┐ ┌ live ┐ (wide terminals)
  │                                 │ │                        │ │      │
  └─────────────────────────────────┘ └────────────────────────┘ └──────┘
@@ -37,7 +37,7 @@ The action bar lists every action of the selected row with its key; dimmed actio
 | F6 | Switch node |
 | F8 | Tasks |
 | F10 | Shell on the node |
-| `g` | Global menu: switch node, pause, task center, alerts, language, shell, about, log out |
+| `g` | Global menu: switch node, pause, task center, alerts (health page), language, shell, about, log out |
 | `?` | Help |
 | Ctrl+Q | Quit (asks; disabled on the system console) |
 
@@ -46,12 +46,12 @@ close).
 
 ## Mouse
 
-Click module and page tabs, action buttons, rows (double or right click opens the menu) and the console preview of a
+Click module and page tabs, action buttons, the alert counter (opens the health page), rows (double or right click opens the menu) and the console preview of a
 VM. The wheel scrolls lists and details.
 
 ## Pausing
 
-F7 freezes everything: page reloads, the live sampler (IO, traffic, status bar) and the alert check. The header shows
+F7 freezes everything: page reloads, the live sampler (IO, traffic, status bar) and the [health checks](health.md). The header shows
 `⏸ paused · F7`. `r` takes one new snapshot while paused.
 
 ## Login and permissions

@@ -21,14 +21,17 @@ use crate::util::{fmt_time, jarr, jb, ji, js};
 pub fn views() -> Vec<Box<dyn View>> {
     vec![
         Box::new(super::overview::Overview::default()),
+        Box::new(super::health::Health::default()),
         Box::new(super::memory::Memory::default()),
         Box::new(super::processes::Processes::default()),
         Box::new(super::hardware::Pci::default()),
         Box::new(super::hardware::Usb::default()),
         Box::new(super::hardware::HwInfo::default()),
+        Box::new(super::bmc::BmcView::default()),
         Box::new(super::updates::Updates::default()),
         Box::new(Users::default()),
         Box::new(Certs::default()),
+        Box::new(super::settings::Settings::default()),
     ]
 }
 

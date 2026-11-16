@@ -16,3 +16,12 @@ console_display = "auto"
 console_fps = 10
 # User for host commands over ssh in remote mode (--ssh).
 ssh_user = "root"
+
+# Health check thresholds (all optional), see docs/en/health.md.
+# [health]
+# fs_warn = 85
+# fs_crit = 95
+# disk_temp_warn = 55
+# nvme_temp_warn = 70
+# zfs_scrub_days = 35
+# growth_hours = 24

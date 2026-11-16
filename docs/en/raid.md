@@ -5,7 +5,7 @@
 The page shows RAID / HBA controllers and NVMe drives through the vendors' command line tools: controllers, virtual
 drives with their member drives, the other drives grouped by role (failed, hot spare, unconfigured, JBOD), battery /
 CacheVault, background tasks, locate / fault LEDs and live IO. Problems (degraded, failed, predictive failure,
-battery, foreign configuration) also go into the alert counter.
+battery, foreign configuration) also go into the [health checks](health.md) and the alert counter.
 
 It needs host access (local or SSH mode) and runs the tools as root.
 

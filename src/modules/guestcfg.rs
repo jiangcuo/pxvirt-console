@@ -1904,19 +1904,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn test_ctx() -> Ctx {
-        Ctx {
-            api: Arc::new(crate::api::Api::pvesh()),
-            session: crate::ctx::Session { user: "root@pam".into(), ..Default::default() },
-            cfg: crate::config::Config::default(),
-            node: "n1".into(),
-            nodes: vec![],
-            local_node: None,
-            remote: false,
-            ssh: None,
-            cmds: vec![],
-            node_arch: Default::default(),
-            metrics: Arc::new(Mutex::new(Default::default())),
-        }
+        Ctx::test()
     }
 
     /// A page with injected data: (key, value, pending, delete).

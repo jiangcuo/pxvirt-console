@@ -10,7 +10,7 @@ node over SSH or the PVE API.
 
 ## Features
 
-- **System**: overview, memory, processes, PCI / USB passthrough, hardware, updates, users, certificates, power
+- **System**: overview, health checks with fixes (SMART, kernel errors, PCIe, ECC, temperatures, BMC, NICs, RAID, ZFS / Ceph, ...), memory, processes, PCI / USB passthrough, hardware, BMC (complete event log, sensors, BMC network), updates, users, certificates, settings (time zone, NTP), power
 - **Network**: management network with automatic rollback, bridges / bonds / VLANs, live traffic, connections per process with disconnect, tools, routes, firewall
 - **Disks**: SMART, LVM, ZFS, Ceph, live IO of every device, NFS / iSCSI / FC / NVMe-oF, hardware RAID / HBA / NVMe through the vendor tools (StorCLI, PERCCLI, ssacli, arcconf, sas2/3ircu, hiraidadm, Areca, HighPoint, mvcli, tw_cli, nvme-cli)
 - **Services & Logs**: systemd services, journal, PVE tasks
@@ -26,6 +26,7 @@ node over SSH or the PVE API.
 
 ```bash
 pxvirt-console --ssh root@node      # manage a node from your workstation (Linux / macOS binaries in Releases)
+pxvirt-console                      # on a workstation: pick one of the saved connections
 sudo pxvirt-console                 # on the node itself
 ```
 

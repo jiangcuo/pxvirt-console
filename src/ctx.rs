@@ -87,6 +87,8 @@ pub enum Cmd {
     Suspend(Suspend),
     Vnc(VncRequest),
     SwitchNode(String),
+    /// Open a page: (module index, view title).
+    Goto(usize, &'static str),
 }
 
 /// Disabled-reason for actions that need host commands in API-only remote mode
@@ -111,6 +113,10 @@ pub struct Ctx {
     pub node_arch: HashMap<String, String>,
     /// Live metrics of the viewed node (shared with the sampler thread).
     pub metrics: Arc<std::sync::Mutex<crate::metrics::MetricsData>>,
+    /// Latest health report of the viewed node.
+    pub health: Option<Arc<crate::health::Report>>,
+    /// Run every health check now (set by the Health page).
+    pub health_now: bool,
 }
 
 impl Ctx {
@@ -248,5 +254,27 @@ impl Ctx {
 
     pub fn audit(&self, what: &str) {
         crate::audit(&self.session.user, &self.node, what);
+    }
+}
+
+#[cfg(test)]
+impl Ctx {
+    /// Context for view tests: root session, pvesh API, node "n1".
+    pub fn test() -> Ctx {
+        Ctx {
+            api: Arc::new(crate::api::Api::pvesh()),
+            session: Session { user: "root@pam".into(), ..Default::default() },
+            cfg: Config::default(),
+            node: "n1".into(),
+            nodes: vec![],
+            local_node: None,
+            remote: false,
+            ssh: None,
+            cmds: vec![],
+            node_arch: Default::default(),
+            metrics: Arc::new(std::sync::Mutex::new(Default::default())),
+            health: None,
+            health_now: false,
+        }
     }
 }

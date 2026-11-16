@@ -27,9 +27,9 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn problems(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.ctls.iter().flat_map(|(_, c)| c.iter().flat_map(|c| c.problems())).map(|p| p.text).collect();
-        v.extend(self.errors.iter().cloned());
+    pub fn problems(&self) -> Vec<(pxvirt_raid::Health, String)> {
+        let mut v: Vec<(pxvirt_raid::Health, String)> = self.ctls.iter().flat_map(|(_, c)| c.iter().flat_map(|c| c.problems())).map(|p| (p.health, p.text)).collect();
+        v.extend(self.errors.iter().map(|e| (pxvirt_raid::Health::Warning, e.clone())));
         v
     }
 }
@@ -55,15 +55,17 @@ pub fn scan_host(exec: &Exec) -> anyhow::Result<Host> {
     Ok(host)
 }
 
-static CACHE: Mutex<Option<HashMap<String, (Instant, Vec<String>)>>> = Mutex::new(None);
+type Problems = Vec<(pxvirt_raid::Health, String)>;
 
-fn store(exec: &Exec, problems: Vec<String>) {
+static CACHE: Mutex<Option<HashMap<String, (Instant, Problems)>>> = Mutex::new(None);
+
+fn store(exec: &Exec, problems: Problems) {
     let mut c = CACHE.lock().unwrap();
     c.get_or_insert_with(HashMap::new).insert(exec.label(), (Instant::now(), problems));
 }
 
 /// Problems for the alert counter: a full scan at most every 5 minutes.
-pub fn problems_cached(exec: &Exec) -> Vec<String> {
+pub fn problems_cached(exec: &Exec) -> Problems {
     if let Some((t, p)) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&exec.label()).cloned()) {
         if t.elapsed() < Duration::from_secs(300) {
             return p;

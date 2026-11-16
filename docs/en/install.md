@@ -27,6 +27,12 @@ xattr -d com.apple.quarantine pxvirt-console
 
 On macOS and other non-Linux systems only `--ssh` and `--remote` are available.
 
+### Saved connections
+
+Every `--ssh` / `--remote` target is remembered in `~/.config/pxvirt-console/connections.json`. Started without a target
+on a machine that is not a PVE node (or with `--connect`), the console shows the list: Enter connects, `a` adds, `e`
+edits, `x` deletes. `--connect NAME` connects to a saved entry directly, `--list` prints them.
+
 Enable the tty1 console after installing the package:
 
 ```bash
@@ -39,6 +45,8 @@ systemctl enable --now pxvirt-console.service
 |---|---|
 | `--ssh [user@]host[:port]` | SSH mode |
 | `--remote host[:port]` | API mode |
+| `--connect`, `-c [name]` | Saved connections: pick one from the list, or connect to `name` directly |
+| `--list`, `-l` | Print the saved connections |
 | `--lang en\|zh\|auto` | Interface language (tty1 is always English) |
 | `--version` | Print the version |
 
@@ -57,6 +65,7 @@ certificate fingerprints). Example: [`debian/config.toml.example`](../../debian/
 | `console_display` | `auto` | Graphical console: `auto` (SDL on tty1, terminal graphics elsewhere), `sdl`, `terminal` |
 | `console_fps` | 10 | Frame limit of the terminal console renderer |
 | `ssh_user` | `root` | User for host commands in SSH mode |
+| `[health]` | | Thresholds of the health checks, see [Health checks](health.md#thresholds) |
 
 ## Recommended terminal
 

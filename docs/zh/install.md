@@ -27,6 +27,10 @@ xattr -d com.apple.quarantine pxvirt-console
 
 macOS 等非 Linux 系统上只能用 `--ssh` 和 `--remote`。
 
+### 保存的连接
+
+每次使用 `--ssh` / `--remote` 的目标都会记录在 `~/.config/pxvirt-console/connections.json`。在不是 PVE 节点的机器上不带参数启动（或使用 `--connect`）时显示连接列表：Enter 连接，`a` 添加，`e` 编辑，`x` 删除。`--connect 名称` 直接连接保存的条目，`--list` 列出全部。
+
 安装 Debian 包后启用 tty1 控制台：
 
 ```bash
@@ -39,6 +43,8 @@ systemctl enable --now pxvirt-console.service
 |---|---|
 | `--ssh [用户@]主机[:端口]` | SSH 模式 |
 | `--remote 主机[:端口]` | API 模式 |
+| `--connect`、`-c [名称]` | 保存的连接：从列表中选择，或直接连接 `名称` |
+| `--list`、`-l` | 列出保存的连接 |
 | `--lang en\|zh\|auto` | 界面语言（tty1 固定为英文） |
 | `--version` | 显示版本 |
 
@@ -57,6 +63,7 @@ systemctl enable --now pxvirt-console.service
 | `console_display` | `auto` | 图形控制台：`auto`（tty1 用 SDL，其他用终端图形）、`sdl`、`terminal` |
 | `console_fps` | 10 | 终端图形控制台的帧率上限 |
 | `ssh_user` | `root` | SSH 模式下执行主机命令的用户 |
+| `[health]` | | 健康检查阈值，见[健康检查](health.md#阈值) |
 
 ## 推荐终端
 

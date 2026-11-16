@@ -23,7 +23,7 @@ use crate::modules::{build_modules, Module};
 use crate::ui::popup::{item, MenuItem, Outcome, Popup};
 use crate::ui::task::TaskView;
 use crate::ui::{self, hint_spans, hsplit, sparkline, style_bad, usage_style, vsplit, ACCENT};
-use crate::util::{fmt_bytes, fmt_rate, jarr, jf, js};
+use crate::util::{fmt_bytes, fmt_rate, js};
 
 pub const APP_VERSION: &str = env!("APP_VERSION");
 
@@ -69,6 +69,8 @@ enum Hit {
     More,
     List,
     Detail,
+    /// alert counter in the status bar
+    Health,
 }
 
 pub struct App {
@@ -94,7 +96,7 @@ pub struct App {
     host_at: Instant,
     cluster: String,
     remote: Option<RemoteTarget>,
-    alerts: Loader<Vec<String>>,
+    alerts: Loader<crate::health::Report>,
     renew: Option<Job<()>>,
     last_renew_check: Instant,
     recover: Option<Job<Arc<Api>>>,
@@ -151,6 +153,8 @@ impl App {
             cmds: Vec::new(),
             node_arch: HashMap::new(),
             cfg: cfg.clone(),
+            health: None,
+            health_now: false,
         };
         let login = Login::new(api, !local_mode, &cfg.default_realm, trust);
         let screen = if local_mode && cfg.prelogin_dashboard {
@@ -280,13 +284,13 @@ impl App {
             out.push_str(&format!("click submenu 2 -> view {}\n", self.modules[self.cur].sel + 1));
         }
         // System > Processes: click the 3rd row, then right click it
-        self.goto(0, 2);
+        self.goto(0, 3);
         frame(self);
-        let before = self.modules[0].views[2].table().and_then(|t| t.selected().map(|s| s.to_string()));
+        let before = self.modules[0].views[3].table().and_then(|t| t.selected().map(|s| s.to_string()));
         if let Some((r, _)) = self.hits.iter().find(|(_, h)| matches!(h, Hit::List)).cloned() {
             let (x, y) = (r.x + 4, r.y + 4);
             self.on_mouse(ev(MK::Down(MB::Left), x, y));
-            let after = self.modules[0].views[2].table().and_then(|t| t.selected().map(|s| s.to_string()));
+            let after = self.modules[0].views[3].table().and_then(|t| t.selected().map(|s| s.to_string()));
             out.push_str(&format!("click process row 3 -> selection {before:?} -> {after:?}\n"));
             self.on_mouse(ev(MK::Down(MB::Right), x, y));
             out.push_str(&format!("right click row -> popups open: {}\n", self.popups.len()));
@@ -396,11 +400,23 @@ impl App {
                 std::thread::sleep(Duration::from_millis(50));
             }
         };
+        // PXVIRT_DUMP_ONLY=Health,Overview limits the dump to these pages
+        let only: Vec<String> = std::env::var("PXVIRT_DUMP_ONLY").map(|v| v.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();
         for m in 0..self.modules.len() {
             for v in 0..self.modules[m].views.len() {
+                if !only.is_empty() && !only.iter().any(|o| o == self.modules[m].views[v].title()) {
+                    continue;
+                }
                 self.goto(m, v);
-                // the RAID scan runs many vendor commands
-                settle(self, if self.modules[m].views[v].title() == "Hardware RAID" { 20000 } else { 3000 });
+                // the RAID scan runs many vendor commands; the first health check reads SMART of every disk
+                let title = self.modules[m].views[v].title();
+                if matches!(title, "Health" | "Overview") {
+                    let end = Instant::now() + Duration::from_secs(120);
+                    while self.ctx.health.is_none() && Instant::now() < end {
+                        settle(self, 500);
+                    }
+                }
+                settle(self, if title == "Hardware RAID" { 20000 } else { 3000 });
                 let name = format!("{}_{}_{}", m + 1, v + 1, self.modules[m].views[v].title().replace([' ', '/', '&'], ""));
                 dump(self, &name)?;
                 // context menu
@@ -526,6 +542,7 @@ impl App {
         self.start_metrics();
         self.fetch_arch();
         self.alerts.clear();
+        self.ctx.health = None;
         let mut what = String::from("login");
         if self.ctx.session.rescue {
             what.push_str(" (rescue mode)");
@@ -616,6 +633,7 @@ impl App {
         self.start_metrics();
         self.fetch_arch();
         self.alerts.clear();
+        self.ctx.health = None;
         self.refresh_current(true);
         self.toast(format!("{}: {}", tr("node"), self.ctx.node), false);
     }
@@ -797,12 +815,19 @@ impl App {
         }
 
         // alerts
-        self.alerts.poll();
-        if self.auto_refresh && self.alerts.stale(Duration::from_secs(30)) {
+        if self.alerts.poll() {
+            self.ctx.health = self.alerts.data.clone().map(Arc::new);
+        }
+        if (self.auto_refresh || self.ctx.health_now) && self.alerts.stale(Duration::from_secs(if self.ctx.health_now { 0 } else { 30 })) {
+            if self.ctx.health_now {
+                crate::health::force();
+            }
+            self.ctx.health_now = false;
             let api = self.ctx.api.clone();
             let node = self.ctx.node.clone();
             let exec = self.ctx.exec();
-            self.alerts.load(move || Ok(collect_alerts(&api, &node, exec)));
+            let th = self.ctx.cfg.health.clone();
+            self.alerts.load(move || Ok(crate::health::collect(&api, &node, exec, &th)));
         }
 
         if let Some((_, _, t)) = &self.toast {
@@ -853,6 +878,10 @@ impl App {
                 Cmd::Suspend(s) => self.pending_suspend = Some(s),
                 Cmd::Vnc(r) => self.pending_vnc = Some(r),
                 Cmd::SwitchNode(n) => self.switch_node(n),
+                Cmd::Goto(m, title) => match self.modules.get(m).and_then(|x| x.views.iter().position(|v| v.title() == title)) {
+                    Some(v) => self.goto(m, v),
+                    None => self.goto_title(title),
+                },
             }
         }
     }
@@ -1219,6 +1248,7 @@ impl App {
                 }
             }
             Some(Hit::More) if left => self.open_context_menu(),
+            Some(Hit::Health) if left => self.goto_title("Health"),
             Some(Hit::Detail) => {
                 if left && self.modules[cm].views[cv].on_click(mx, my, &mut self.ctx) {
                     self.process_cmds(Origin::View(cm, cv));
@@ -1376,13 +1406,7 @@ impl App {
                 self.toggle_pause();
             }
             't' => self.goto_title("Tasks"),
-            'A' => {
-                let text = match &self.alerts.data {
-                    Some(a) if !a.is_empty() => a.join("\n"),
-                    _ => tr("No alerts").to_string(),
-                };
-                self.popups.push((Popup::text("Alerts", &text), Origin::Global));
-            }
+            'A' => self.goto_title("Health"),
             'L' => {
                 if !i18n::toggle() {
                     self.toast("this terminal cannot display Chinese".into(), true);
@@ -1520,8 +1544,10 @@ impl App {
             }
             i += 1;
         }
-        let alerts = self.alerts.data.as_ref().map(|a| a.len());
-        draw_status(f, rows[i], &mdata, Some((alerts, self.bg_tasks.len() + self.actions.len())));
+        let alerts = self.ctx.health.as_ref().map(|r| (r.alerts().count(), r.worst()));
+        if let Some(r) = draw_status(f, rows[i], &mdata, Some((alerts, self.bg_tasks.len() + self.actions.len()))) {
+            self.hits.push((r, Hit::Health));
+        }
         i += 1;
         self.draw_hints(f, rows[i]);
 
@@ -1723,11 +1749,12 @@ fn action_bar_lines(items: &[MenuItem], width: u16) -> (Vec<Line<'static>>, Chip
 }
 
 /// Bottom status line: CPU · memory · network · disk, alerts and running tasks on the right.
-fn draw_status(f: &mut Frame, area: Rect, m: &MetricsData, extra: Option<(Option<usize>, usize)>) {
+/// Returns the area of the alert counter (clickable).
+fn draw_status(f: &mut Frame, area: Rect, m: &MetricsData, extra: Option<(Option<(usize, crate::health::Sev)>, usize)>) -> Option<Rect> {
     let lab = Style::default().fg(Color::DarkGray);
     if !m.ok {
         f.render_widget(Paragraph::new(Span::styled(" metrics unavailable", lab)), area);
-        return;
+        return None;
     }
     let spark = area.width >= 130;
     let coarse = if m.coarse { "~" } else { "" };
@@ -1750,18 +1777,24 @@ fn draw_status(f: &mut Frame, area: Rect, m: &MetricsData, extra: Option<(Option
         s.push(Span::styled(format!("   {} proc · {} thr", m.procs, m.threads), lab));
     }
     let mut right: Vec<Span> = Vec::new();
+    let mut alert_w = 0;
     if let Some((alerts, tasks)) = extra {
         if tasks > 0 {
             right.push(Span::styled(format!("◷ {tasks} {}  ", tr("Tasks")), Style::default().fg(ACCENT)));
         }
-        if let Some(n) = alerts.filter(|n| *n > 0) {
-            right.push(Span::styled(format!("● {n} {} ", tr("Alerts")), style_bad()));
-        }
+        let a = match alerts {
+            Some((n, sev)) if n > 0 => Span::styled(format!("● {n} {} ", tr("Alerts")), if sev >= crate::health::Sev::Crit { style_bad() } else { ui::style_warn() }),
+            Some(_) => Span::styled(format!("● {} ", tr("Healthy")), ui::style_good()),
+            None => Span::raw(""),
+        };
+        alert_w = a.width() as u16;
+        right.push(a);
     }
     let rw: usize = right.iter().map(|x| x.width()).sum();
     let parts = hsplit(area, &[Constraint::Min(10), Constraint::Length(rw as u16)]);
     f.render_widget(Paragraph::new(Line::from(s)), parts[0]);
     f.render_widget(Paragraph::new(Line::from(right)), parts[1]);
+    (alert_w > 0).then(|| Rect::new(parts[1].x + parts[1].width - alert_w, parts[1].y, alert_w, 1))
 }
 
 /// Extra column on very wide terminals: bigger live graphs.
@@ -1781,56 +1814,6 @@ fn draw_metrics_panel(f: &mut Frame, area: Rect, m: &MetricsData) {
         lines.push(Line::from(format!("ZFS ARC {}", fmt_bytes(m.arc_size))));
     }
     f.render_widget(Paragraph::new(lines).block(ui::block("Live", false)), area);
-}
-
-/// Cluster/node health problems shown as the alert count in the status bar.
-fn collect_alerts(api: &Api, node: &str, exec: Option<crate::exec::Exec>) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(v) = api.get("/cluster/status") {
-        for e in jarr(&v) {
-            match js(&e, "type").as_str() {
-                "cluster" if jf(&e, "quorate") == 0.0 => out.push(format!("cluster {} is NOT quorate", js(&e, "name"))),
-                "node" if jf(&e, "online") == 0.0 => out.push(format!("node {} is offline", js(&e, "name"))),
-                _ => {}
-            }
-        }
-    }
-    if let Ok(v) = api.get(&format!("/nodes/{node}/disks/zfs")) {
-        for p in jarr(&v) {
-            let h = js(&p, "health");
-            if h != "ONLINE" {
-                out.push(format!("ZFS pool {} is {h}", js(&p, "name")));
-            }
-        }
-    }
-    if let Ok(v) = api.get(&format!("/nodes/{node}/ceph/status")) {
-        if let Some(h) = v.get("health") {
-            let s = js(h, "status");
-            if !s.is_empty() && s != "HEALTH_OK" {
-                out.push(format!("Ceph {s}"));
-            }
-        }
-    }
-    if let Ok(v) = api.get(&format!("/nodes/{node}/storage")) {
-        for s in jarr(&v) {
-            let frac = jf(&s, "used_fraction");
-            if frac >= 0.9 && jf(&s, "active") != 0.0 {
-                out.push(format!("storage {} is {:.0}% full", js(&s, "storage"), frac * 100.0));
-            }
-        }
-    }
-    if let Some(exec) = exec {
-        // hardware RAID / NVMe health (full scan at most every 5 minutes)
-        out.extend(crate::raidhost::problems_cached(&exec));
-        if let Ok(o) = exec.output("systemctl", &["--failed", "--no-legend", "--plain", "--type=service"]) {
-            for l in o.lines() {
-                if let Some(u) = l.split_whitespace().next() {
-                    out.push(format!("unit {u} failed"));
-                }
-            }
-        }
-    }
-    out
 }
 
 const HELP_EN: &str = "\

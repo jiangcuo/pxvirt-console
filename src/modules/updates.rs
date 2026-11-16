@@ -117,7 +117,7 @@ impl Updates {
         self.refreshing = Some(Job::spawn(move || run_apt_update(api, node)));
     }
 
-    fn suspend_apt(ctx: &mut Ctx, args: Vec<String>, banner: String) {
+    pub(crate) fn suspend_apt(ctx: &mut Ctx, args: Vec<String>, banner: String) {
         if let Some(exec) = ctx.exec() {
             ctx.audit(&format!("apt-get {}", args.join(" ")));
             ctx.cmds.push(Cmd::Suspend(Suspend {

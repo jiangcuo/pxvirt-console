@@ -9,7 +9,7 @@ PXVIRT / Proxmox VE 的文本界面节点管理控制台，类似 VMware ESXi �
 
 ## 功能
 
-- **系统**：概览、内存、进程、PCI / USB 直通、硬件信息、更新、用户、证书、电源
+- **系统**：概览、健康检查和修复（SMART、内核错误、PCIe、ECC、温度、BMC、网卡、RAID、ZFS / Ceph 等）、内存、进程、PCI / USB 直通、硬件信息、BMC（完整事件日志、传感器、BMC 网络）、更新、用户、证书、设置（时区、NTP）、电源
 - **网络**：带自动回滚的管理网络、网桥 / Bond / VLAN、实时流量、按进程查看连接并可断开、诊断工具、路由、防火墙
 - **磁盘**：SMART、LVM、ZFS、Ceph、所有设备的实时 IO、NFS / iSCSI / FC / NVMe-oF，以及通过厂商工具管理硬件 RAID / HBA / NVMe（StorCLI、PERCCLI、ssacli、arcconf、sas2/3ircu、hiraidadm、Areca、HighPoint、mvcli、tw_cli、nvme-cli）
 - **服务日志**：systemd 服务、journal 日志、PVE 任务
@@ -25,6 +25,7 @@ PXVIRT / Proxmox VE 的文本界面节点管理控制台，类似 VMware ESXi �
 
 ```bash
 pxvirt-console --ssh root@节点      # 在自己的电脑上管理节点（Releases 里有 Linux / macOS 二进制）
+pxvirt-console                      # 在自己的电脑上：从保存的连接中选择
 sudo pxvirt-console                 # 直接在节点上运行
 ```
 

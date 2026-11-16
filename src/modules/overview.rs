@@ -176,6 +176,33 @@ impl View for Overview {
             let cpu = s.get("cpuinfo").cloned().unwrap_or(Value::Null);
             let kern = s.get("current-kernel").cloned().unwrap_or(Value::Null);
 
+            kv.section("Health");
+            match ctx.health.as_deref() {
+                None => {
+                    kv.styled("Status", tr("Checking..."), style_dim());
+                }
+                Some(r) => {
+                    let alerts: Vec<&crate::health::Finding> = r.alerts().collect();
+                    let worst = r.worst();
+                    let summary = if alerts.is_empty() {
+                        tr("Healthy").to_string()
+                    } else {
+                        format!("{} {} · {} {}", r.count(crate::health::Sev::Crit), tr("critical"), r.count(crate::health::Sev::Warn), tr("warnings"))
+                    };
+                    kv.styled("Status", format!("{summary}   (2 = {})", tr("details")), super::health::sev_style(worst));
+                    for a in alerts.iter().take(5) {
+                        let mut line = format!("{}  {}", a.title.text(), a.value);
+                        if line.chars().count() > 70 {
+                            line = line.chars().take(69).collect::<String>() + "…";
+                        }
+                        kv.styled(tr(a.cat.label()), line, super::health::sev_style(a.sev));
+                    }
+                    if alerts.len() > 5 {
+                        kv.styled("", format!("+{} …", alerts.len() - 5), style_dim());
+                    }
+                }
+            }
+
             kv.section("Software");
             kv.styled("Console", format!("PXVIRT Console {}", crate::app::APP_VERSION), Style::default().fg(ACCENT));
             kv.add("PVE", js(s, "pveversion").trim_start_matches("pve-manager/").to_string());
@@ -295,7 +322,7 @@ impl View for Overview {
                     ]));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(tr("3 = all processes"), style_dim())));
+                lines.push(Line::from(Span::styled(tr("4 = all processes"), style_dim())));
             }
             Some(_) => lines.push(Line::from(Span::styled(if ctx.exec().is_some() { tr("Loading...") } else { tr("local only") }, style_dim()))),
             None => {}

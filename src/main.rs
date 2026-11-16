@@ -1,9 +1,12 @@
 mod api;
 mod app;
 mod backend;
+mod bmc;
 mod config;
+mod connpick;
 mod ctx;
 mod exec;
+mod health;
 mod i18n;
 mod loader;
 mod login;
@@ -53,37 +56,51 @@ struct Args {
     lang: Option<String>,
     vnc_test: Option<String>,
     dump: Option<String>,
+    /// --connect [NAME]: Some("") = show the saved connections
+    connect: Option<String>,
 }
 
 fn usage() -> ! {
     println!(
-        "pxvirt-console {APP_VERSION}\n\n\
-Usage: pxvirt-console [options]\n\n\
-  --remote HOST[:PORT]   manage a remote PVE host through its API (default port 8006)\n\
-  --ssh [USER@]HOST[:PORT]  manage a node over ssh: API through a port forward plus host\n\
-                         commands; as root you are logged in as root@pam automatically\n\
-  --lang en|zh|auto      interface language (tty1 is always English)\n\
-  --vnc-test SOCKET      debug: open the graphical viewer on a raw VNC unix socket\n\
-  --version              print version\n"
+        r#"pxvirt-console {APP_VERSION}
+
+Usage: pxvirt-console [options]
+
+  --ssh [USER@]HOST[:PORT]  manage a node over ssh: API through a port forward plus host
+                            commands; as root you are logged in as root@pam automatically
+  --remote HOST[:PORT]      manage a remote PVE host through its API (default port 8006)
+  --connect, -c [NAME]      saved connections: pick one, or connect to NAME directly
+                            (also shown when started without a target on a non-PVE machine)
+  --list, -l                print the saved connections
+  --lang en|zh|auto         interface language (tty1 is always English)
+  --vnc-test SOCKET         debug: open the graphical viewer on a raw VNC unix socket
+  --version                 print version"#
     );
     std::process::exit(0)
 }
 
+fn remote_target(v: &str) -> RemoteTarget {
+    let (host, port) = match v.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') || h.ends_with(']') => (h.trim_matches(|c| c == '[' || c == ']').to_string(), p.parse().unwrap_or(8006)),
+        _ => (v.trim_matches(|c| c == '[' || c == ']').to_string(), 8006),
+    };
+    RemoteTarget { host, port }
+}
+
 fn parse_args() -> Args {
-    let mut a = Args { remote: None, ssh: None, lang: None, vnc_test: None, dump: None };
-    let mut it = std::env::args().skip(1);
+    let mut a = Args { remote: None, ssh: None, lang: None, vnc_test: None, dump: None, connect: None };
+    let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--remote" | "-r" => {
                 let v = it.next().unwrap_or_else(|| usage());
-                let (host, port) = match v.rsplit_once(':') {
-                    Some((h, p)) if !h.contains(':') || h.ends_with(']') => {
-                        (h.trim_matches(|c| c == '[' || c == ']').to_string(), p.parse().unwrap_or(8006))
-                    }
-                    _ => (v.trim_matches(|c| c == '[' || c == ']').to_string(), 8006),
-                };
-                a.remote = Some(RemoteTarget { host, port });
+                a.remote = Some(remote_target(&v));
             }
+            "--list" | "-l" => {
+                print!("{}", connpick::list_text(&connpick::load()));
+                std::process::exit(0);
+            }
+            "--connect" | "-c" => a.connect = Some(it.next_if(|n| !n.starts_with('-')).unwrap_or_default()),
             "--ssh" | "-s" => a.ssh = Some(it.next().unwrap_or_else(|| usage())),
             "--lang" => a.lang = it.next(),
             "--vnc-test" => a.vnc_test = it.next(),
@@ -112,15 +129,41 @@ fn parse_args() -> Args {
 }
 
 fn main() -> Result<()> {
-    let args = parse_args();
-    if !cfg!(target_os = "linux") && args.remote.is_none() && args.ssh.is_none() && args.vnc_test.is_none() {
-        // no PVE on this machine: client modes only
-        eprintln!("pxvirt-console manages PVE nodes remotely on this system:\n  pxvirt-console --ssh root@NODE\n  pxvirt-console --remote NODE");
-        std::process::exit(2);
-    }
+    let mut args = parse_args();
     let mut cfg = config::Config::load();
-    if let Some(l) = args.lang {
+    if let Some(l) = args.lang.take() {
         cfg.lang = l;
+    }
+    // no target: saved connections when this machine is not a PVE node (or with --connect)
+    let no_target = args.remote.is_none() && args.ssh.is_none() && args.vnc_test.is_none() && args.dump.is_none();
+    let pve_here = cfg!(target_os = "linux") && std::path::Path::new("/etc/pve").exists();
+    if no_target && (args.connect.is_some() || !pve_here) {
+        let name = args.connect.take().unwrap_or_default();
+        let chosen = if name.is_empty() {
+            if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
+                eprintln!("pxvirt-console manages PVE nodes remotely on this system:\n  pxvirt-console --ssh root@NODE\n  pxvirt-console --remote NODE");
+                std::process::exit(2);
+            }
+            i18n::init(&cfg.lang);
+            match connpick::run()? {
+                Some(c) => c,
+                None => return Ok(()),
+            }
+        } else {
+            connpick::find(&name).unwrap_or_else(|| {
+                eprintln!("pxvirt-console: no saved connection named {name}");
+                std::process::exit(2);
+            })
+        };
+        match chosen.kind.as_str() {
+            "api" => args.remote = Some(remote_target(&chosen.target)),
+            _ => args.ssh = Some(chosen.target),
+        }
+    }
+    if let Some(r) = &args.remote {
+        if args.dump.is_none() {
+            connpick::remember("api", &if r.port == 8006 { r.host.clone() } else { format!("{}:{}", r.host, r.port) });
+        }
     }
     if let Some(dir) = args.dump {
         // debug: render all views (local: needs root for the ticket; --ssh: root@ ssh)
@@ -168,6 +211,7 @@ fn main() -> Result<()> {
         Some(spec) => match sshconn::SshConn::connect(spec) {
             Ok(c) => {
                 let _ = AUDIT_EXEC.set(c.exec());
+                connpick::remember("ssh", spec);
                 Some(c)
             }
             Err(e) => {

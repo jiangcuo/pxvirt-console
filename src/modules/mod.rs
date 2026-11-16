@@ -1,10 +1,12 @@
 //! Top-level modules (System, Network, Disks, Services & Logs, PVE) and the View trait.
 
+pub mod bmc;
 pub mod conns;
 pub mod disks;
 pub mod diskio;
 pub mod guestcfg;
 pub mod hardware;
+pub mod health;
 pub mod memory;
 pub mod netmgmt;
 pub mod netstorage;
@@ -15,6 +17,7 @@ pub mod processes;
 pub mod pve_create;
 pub mod raid;
 pub mod services;
+pub mod settings;
 pub mod system;
 pub mod updates;
 
